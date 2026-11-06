@@ -1,9 +1,32 @@
-# Blade Ball — BYAKUGAN RS26.7 (Audi RS × iOS 26 Fluid)
+# Blade Ball — BYAKUGAN RS26.8 (Audi RS × iOS 26 Fluid)
 
 Mobile auto-parry for **Roblox Blade Ball**, built for **Delta iOS**.
 The original **RS HUD** is back — Tango Red / Carbon Audi look — rebuilt with
 iOS 26 liquid-glass motion: spring bounces, elastic pops, fluid steppers,
 parry shockwaves, a Dynamic Island and an animated boot sequence.
+
+**v26.8 — ROTATION CURVE (new):**
+- the ball is steered by whoever it is locked ON: the server bends the
+  flight with the steerer's replicated character rotation (camera flick =
+  curve; first person is the mobile default, so their root yaw IS their
+  view yaw — and it replicates to every client)
+- the script now tracks the steering player's **yaw rate** (`d(yaw)/dt`)
+  and predicts the lateral steering acceleration **before the ball's own
+  motion shows it** — the measured acceleration always trails an active
+  flick, which is exactly why curved balls used to fire panic-late
+- physics: turning a velocity vector at rate `w` costs `speed × w` of
+  sideways acceleration, so `a_rot = 0.4 × w × speed` toward the steerer's
+  turn side, capped at 900, deadband `0.35 rad/s` (ordinary aim drift is
+  not a curve)
+- feeds the **PREDICT** measurement: `measBall` now uses
+  `measured acc + rotation acc`
+- **curve veto relaxed** under PREDICT + ROTATION: when the opponent's yaw
+  rate confirms an active curve (`≥ 1 rad/s`) and the predicted path still
+  passes inside your hit radius, the TTI branch may fire DURING the curve —
+  on-time parries on curved balls instead of the late PANIC-only fire.
+  Without PREDICT the veto behaves exactly as before
+- new **ROTATION** stepper: `ON · OFF` (default ON — dormant until PREDICT
+  is on; turn OFF to restore v26.7 curve handling exactly)
 
 **v26.7 — ANTI-DOUBLE-PARRY (fix):**
 - the trigger could fire a **second packet on the same approach**: the speed
@@ -152,8 +175,10 @@ proximity fallback uses REAL distance only (v26.4)
 
 ```
 lead       = PREDICT% × parry_time_offset          (OFF = 0)
-measBall   = ballPos + vel × lead + ½ × accel × lead²
+measBall   = ballPos + vel × lead + ½ × accel × lead²          (v26.6)
+           = ballPos + vel × lead + ½ × (accel + rotationAccel) × lead²   (v26.8)
 trigger    measures measBall instead of the real ball
+rotationAccel = 0.4 × yawRate(steerer) × speed, toward the steerer's turn side
 fireWindow unchanged — predict adds lead on the MEASUREMENT side only,
            so the total lead = window + predict, never double-counted
 ```
@@ -191,6 +216,7 @@ Toggle `AUTO SPAM <15` on the HUD (ON by default).
 | PARRY METHOD | `Auto (Smart) · Hook Replay · Button · Firesignal · Remote` |
 | CURVE MODE | `Camera · Random · Accelerated · Backwards · Slow · High · Normal · Speed · Down · Left · Right` |
 | PREDICT | Future-ball lead: `OFF · 25% · 50% · 75% · 100%` of the parry offset (default OFF) |
+| ROTATION | Rotation-curve prediction from the steering player's yaw rate (default ON; needs PREDICT to act) |
 
 Stats strip: **PING · BALL SPD · RADIUS · OFFSET** (live parry time offset).
 Diagnostics: `RESCAN TOKEN` / `RE-ARM HOOK` buttons + token/capture caption.
@@ -209,4 +235,5 @@ Close (`×`) unloads the script completely.
 | Dies at long range / high speed | Fixed in v26.1 — TTI trigger + panic refire. Watch the island: it shows live `TTI 0.xx` countdown when targeted |
 | Fires when the ball is far away | Fixed in v26.4 — the trigger used the time-extrapolated ball and read it as "close"; it now measures the real ball only |
 | Parries too early with PREDICT on | PREDICT adds extra lead on top of the v26.4 window by design — step it down (50% → 25%) or set OFF; OFF is the v26.5 timing exactly |
+| Curved balls still parry late (PANIC only) | Turn PREDICT on (25–50%) and keep ROTATION ON — the steerer's yaw rate leads the curve so TTI can fire during the bend. If a friend's curves predict the wrong side, flip ROTATION OFF and report it — the turn-side gain is tunable |
 | Double parries, then dies on cooldown | Fixed in v26.7 — the second packet fired while the redirect was still replicating and wasted the parry cooldown before contact. TTI now fires once per approach and PANIC waits out `2 × ping + 0.06` first; the lockout ping is `max(Data Ping, GetNetworkPing)` so it can't collapse to 0 |
