@@ -1,9 +1,29 @@
-# Blade Ball — BYAKUGAN RS27 (Audi RS × iOS 26 Fluid)
+# Blade Ball — BYAKUGAN RS27.1 (Audi RS × iOS 26 Fluid)
 
 Mobile auto-parry for **Roblox Blade Ball**, built for **Delta iOS**.
 The original **RS HUD** is back — Tango Red / Carbon Audi look — rebuilt with
 iOS 26 liquid-glass motion: spring bounces, elastic pops, fluid steppers,
 parry shockwaves, a Dynamic Island and an animated boot sequence.
+
+**v27.1 — APPROACH RESOLVER (double-parry, round two):**
+- **why v26.7 still doubled**: the once-per-approach gate released when the
+  ball's velocity drifted more than 6 studs/s — but the ball **homes**, so a
+  dodging target bends its velocity past that within ~0.1 s. The gate
+  dissolved while the ball was still incoming, the lockout expired, and the
+  TTI branch fired a **second packet on the same approach**. A deflected
+  ball grazing you could also bait PANIC the instant the redirect changed
+  the velocity
+- the gate **no longer reads velocity at all**: TTI fires **exactly once per
+  approach** — release only on a target change, a new ball, or a 1.2 s
+  failsafe
+- a per-frame watcher latches the approach-ending event: an **instant
+  direction flip** (dot < 0.3 between frames — a curve bends < 5°/frame, a
+  redirect is 90°+ at once), so curves can never false-trigger it
+- **PANIC stays the true-miss last chance** (no flip seen, retries ≤ 4) but
+  is **blocked once the redirect is observed** — a resolved approach can
+  never spend the game's parry cooldown on a wasted packet
+- a target change re-arms everything (fire record cleared + flip latch
+  reset) — 1v1 rallies keep working
 
 **v27.0 — NEURA NETWORK (new) + SPAM "even faster":**
 - a real **8 → 6 → 1 neural network** (tanh MLP) trains **live on your own
@@ -287,6 +307,6 @@ Close (`×`) unloads the script completely.
 | Fires when the ball is far away | Fixed in v26.4 — the trigger used the time-extrapolated ball and read it as "close"; it now measures the real ball only |
 | Parries too early with PREDICT on | PREDICT adds extra lead on top of the v26.4 window by design — step it down (50% → 25%) or set OFF; OFF is the v26.5 timing exactly |
 | Curved balls still parry late (PANIC only) | Turn PREDICT on (25–50%) and keep ROTATION ON — the steerer's yaw rate leads the curve so TTI can fire during the bend. If a friend's curves predict the wrong side, flip ROTATION OFF and report it — the turn-side gain is tunable |
-| Double parries, then dies on cooldown | Fixed in v26.7 — the second packet fired while the redirect was still replicating and wasted the parry cooldown before contact. TTI now fires once per approach and PANIC waits out `2 × ping + 0.06` first; the lockout ping is `max(Data Ping, GetNetworkPing)` so it can't collapse to 0 |
+| Double parries, then dies on cooldown | v26.7 fired once per approach but its gate released on a 6 stud/s velocity drift — a homing ball bends past that in ~0.1 s, so the second packet still went out. **Fixed in v27.1**: the approach closes only on a target change / new ball / 1.2 s failsafe, and the observed redirect (instant velocity flip) blocks PANIC, so a resolved approach can never waste the parry cooldown |
 | Parry timing got worse after NEURA learned | Give it 10–20 approaches to converge (watch it settle); if a weird session poisoned it, re-execute the script — the net resets and re-learns. `NEURA OFF` = exact v26.9 timing |
 | Spam drains too fast / too slow | Engagement is 30 fires @ ~50/s (0.6 s envelope) with a 1 s post-cap cooldown — tuned so the saturation window covers `2 × ping + 0.06`; ask for a retune with your ping if it still misses |
