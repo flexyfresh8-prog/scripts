@@ -1,9 +1,13 @@
-# Blade Ball — BYAKUGAN RS26 (Audi RS × iOS 26 Fluid)
+# Blade Ball — BYAKUGAN RS26.1 (Audi RS × iOS 26 Fluid)
 
 Mobile auto-parry for **Roblox Blade Ball**, built for **Delta iOS**.
 The original **RS HUD** is back — Tango Red / Carbon Audi look — rebuilt with
 iOS 26 liquid-glass motion: spring bounces, elastic pops, fluid steppers,
 parry shockwaves, a Dynamic Island and an animated boot sequence.
+
+**v26.1 — LONG-RANGE HIGH-SPEED update:** time-to-impact interception,
+second-order (curved) server-ball extrapolation, capped curve-veto, adaptive
+cooldown + panic refire. No more dying to 500+ stud/s balls from 300+ studs.
 
 ## Run it (Delta mobile)
 
@@ -29,13 +33,33 @@ loadstring(game:HttpGet("https://raw.githubusercontent.com/YOUR-USERNAME/scripts
 ```
 parry_time_offset = 2 × (playerPing + clientPing + machineDelay)
 
-serverBallPos = ballPos + ballVelocity × parry_time_offset
+serverBallPos = ballPos + ballVelocity × offset + ½ × accel × offset²
 ```
 
-The offset extrapolates the **server-side ball position**; the parry fires
-when the server ball (or the real ball) enters the NAZK parry-accuracy
-radius (`ping + speed` derived). The yellow dot shows the extrapolated
-server ball in real time.
+The offset extrapolates the **server-side ball position** (second-order:
+per-frame acceleration tracking follows curved flight). The yellow dot shows
+the extrapolated server ball in real time.
+
+### v26.1 — time-to-impact interception (long range, high speed)
+
+```
+tti      = along-path distance / speed          (closest point on flight path)
+lateral  = miss-distance of the path from you
+fire when  tti ≤ fireWindow  AND  lateral ≤ hitRadius
+fireWindow = clamp(offset + 0.07 + speed/5000, 0.09, 0.55)
+```
+
+- **Distance-independent** — a 700 stud/s ball triggers on TIME, never on a
+  radius it can cross between two frames.
+- **Curve-veto cap** — other players' parries can only block your parry for
+  max 1.2 s regardless of range (was: `reachTime/1.1` = seconds of deafness
+  at long range).
+- **Adaptive cooldown** — `0.5 − speed/1600` (0.14–0.5 s): fast balls re-arm
+  fast, so a wasted early fire can still be corrected.
+- **PANIC refire** — contact imminent (`tti ≤ 45%` of window): fires anyway,
+  curve veto ignored, up to 4 attempts per target cycle.
+- **Proximity fallback** — the old radius trigger still handles slow/close
+  balls (trusted under 140 stud/s, or inside 70 studs).
 
 ## Auto spam
 
@@ -70,3 +94,4 @@ Close (`×`) unloads the script completely.
 | `PRY NO GETGC` | Executor lacks `getgc` — hook replay unavailable, use Button method |
 | Capture never arms | Tap block once manually so the game sends the real packet |
 | Parries feel early/late | Watch the OFFSET stat — it is `2×(pings + machine delay)` by design; curve balls are skipped automatically |
+| Dies at long range / high speed | Fixed in v26.1 — TTI trigger + panic refire. Watch the island: it shows live `TTI 0.xx` countdown when targeted |
