@@ -1,9 +1,2514 @@
+-- ============================================================
+-- Blade Ball Mobile — BYAKUGAN RS26.5  (Audi RS × iOS 26 Fluid)
+-- ============================================================
+-- UI   : the original RS HUD is back — same Tango Red / Carbon
+--        Audi look, rebuilt with iOS 26 liquid-glass motion:
+--        spring bounces, elastic pops, fluid steppers, parry
+--        shockwaves, Dynamic Island, animated boot.
+-- ENGINE: the working NAZK recipe, untouched:
+--        1. getgc scan -> PRY time-token function (signs every
+--           parry; homemade args can NEVER pass server checks).
+--        2. Metatable hook on every remote's FireServer /
+--           InvokeServer -> the first 8-arg packet the GAME
+--           itself sends is captured (tap block once to arm).
+--        3. Auto-parry REPLAYS that exact packet with a fresh
+--           token + live curve CFrame + entity screen data.
+-- PARRY MATH:
+--        parry_time_offset = 2 x (playerPing + clientPing
+--                                    + machineDelay)
+--        applied to extrapolate the SERVER-side ball position.
+-- LONG-RANGE HS (v26.1) — time-to-impact interception:
+--        1. Second-order extrapolation: velocity ACCELERATION
+--           is tracked per-frame, server ball = pos + vel*t
+--           + 0.5*acc*t^2 (curved flight, not a straight lie).
+--        2. Path/TTI trigger: closest-point-on-path math —
+--           lateral miss-distance + time-to-impact along the
+--           ball's flight path. Fires when TTI <= fire window
+--           (offset + margin + speed spread). Frame-rate and
+--           DISTANCE independent — no more dying at 400 studs.
+--        3. Curve-veto cap: other players' parries can only
+--           block your parry max 1.2 s, no matter the range.
+--        4. Adaptive cooldown: 0.72 s at slow balls down to
+--           0.16 s at 800+ studs/s, plus PANIC refire when the
+--           ball is about to connect — a wasted early fire no
+--           longer means death.
+-- AUTO SPAM:
+--        distance(ball -> its target) <= 15 studs  ->  spam
+--        ENGAGES (rapid hook-replay fires) and releases above
+--        22 studs (hysteresis, no flicker).
+-- Boot-safety: UI builds FIRST, no infinite waits, every error
+--        shows a visible red panel instead of silent death.
+-- v26.2 — SMOOTH + MINIMAL:
+--        · BYAKU-BOT ascii robot lives in the Dynamic Island
+--          (blinks, smiles, jumps up every now and then)
+--        · parry flash is now minimal WHITE (red removed)
+--        · PERF MODE: plastic-ifies parts, kills textures/
+--          particles/shadows/beams/highlights, drops quality —
+--          fully restorable on toggle-off
+--        · anti-lag HUD: cached label writes, quantized TTI
+--          text, throttled stats, frozen cosmetic tweens in perf
+--        · darker minimal RS theme + staggered row cascade on open
+-- v26.3 — SURVIVAL FIX (spam-kill bug):
+--        · auto spam engages ONLY when the ball is actually coming
+--          TO US (target == me) — spamming a ball that was passing
+--          to someone else redirected it straight into us
+--        · fires hard-capped at 14/engagement, throttled to 0.09 s
+--        · target-attribute flicker can no longer re-arm the parry
+--        · panic refire lateral tolerance tightened (1.5x radius)
+-- v26.4 — TIMING FIX (cross-map spam + early parries):
+--        the trigger was measuring the PHANTOM ball (pos already
+--        pushed `offset` seconds into the future, up to ~200 studs
+--        ahead at speed) and the fire window added the SAME offset
+--        again on top — the lead was double-counted. Result: a ball
+--        half a map away read as "10 studs" (proxHit) and tti read
+--        ~1 s small (ttiHit) -> spam fires across the map + parries
+--        way too early.
+--        · TTI / lateral now measured from the REAL ball position
+--        · proximity fallback uses REAL distance only
+--        · fire window = the pure send lead: 1 x (pings + machine)
+--          (= half the offset formula — its other half used to hide
+--          inside the phantom-ball subtraction)
+--        · the offset formula STILL drives the server-ball dot +
+--          prediction exactly as designed (2 x pings + machine)
+-- v26.5 — BOOT FAILSAFE ("never gets past booting" — fixed):
+--        · getgc PRY scan now yields every 1000 objects — on long-
+--          running servers the no-yield scan hogged the VM for 30+ s
+--          and froze boot card / tracer / the whole game mid-boot
+--        · single-flight scan guard: hook install, boot animation and
+--          diag panel can no longer race each other into double scans
+--        · post-animation tail is pcall'd; a 9 s failsafe force-
+--          finishes the boot (card destroyed, HUD + panel opened) if
+--          the animation thread ever dies mid-way
+--        · executor fetches WITHOUT the HttpGet cache flag — a stale
+--          cached build is a classic "executed, nothing happened"
+-- ============================================================
+
+-- ============================================================
+-- [0] BOOT TRACER — on-screen milestone pill. Every boot stage updates
+--      it; any fatal error turns it red with the exact message. Kills
+--      the "executed but nothing happened" blind spot for good.
+-- ============================================================
+local bootSay = nil
+do
+        pcall(function()
+                local g = Instance.new("ScreenGui")
+                g.Name = "ByakTrace"
+                g.ResetOnSpawn = false
+                g.IgnoreGuiInset = true
+                g.DisplayOrder = 99999
+                g.Parent = (typeof(gethui) == "function" and gethui())
+                        or game:GetService("CoreGui")
+                local t = Instance.new("TextLabel")
+                t.AnchorPoint = Vector2.new(0.5, 0)
+                t.Position = UDim2.new(0.5, 0, 0, 46)
+                t.Size = UDim2.new(0, 440, 0, 30)
+                t.BackgroundColor3 = Color3.fromRGB(8, 8, 10)
+                t.BackgroundTransparency = 0.12
+                t.Font = Enum.Font.GothamBold
+                t.TextSize = 12
+                t.TextColor3 = Color3.fromRGB(120, 220, 140)
+                t.Text = "[BYAK 1/6] services + tracer…"
+                t.Parent = g
+                Instance.new("UICorner", t).CornerRadius = UDim.new(0, 10)
+                bootSay = function(s, bad)
+                        pcall(function()
+                                t.Text = s
+                                t.TextColor3 = bad and Color3.fromRGB(255, 90, 90)
+                                        or Color3.fromRGB(120, 220, 140)
+                        end)
+                end
+                task.delay(45, function() pcall(function() g:Destroy() end) end)
+        end)
+end
+if not bootSay then bootSay = function() end end
+
+local function byakFatal(msg)
+        bootSay("[BYAK ✖] " .. tostring(msg):sub(1, 90), true)
+        pcall(function()
+                local Players = game:GetService("Players")
+                local lp = Players.LocalPlayer
+                local g = Instance.new("ScreenGui")
+                g.Name = "ByakuganBootError"
+                g.ResetOnSpawn = false
+                g.IgnoreGuiInset = true
+                g.DisplayOrder = 99999
+                local parented = pcall(function()
+                        g.Parent = (typeof(gethui) == "function" and gethui()) or game:GetService("CoreGui")
+                end)
+                if not parented and lp then
+                        g.Parent = lp:WaitForChild("PlayerGui", 5)
+                end
+                local box = Instance.new("Frame")
+                box.Size = UDim2.new(0, 320, 0, 170)
+                box.Position = UDim2.new(0.5, -160, 0.5, -85)
+                box.BackgroundColor3 = Color3.fromRGB(24, 8, 10)
+                box.BorderSizePixel = 0
+                box.Parent = g
+                Instance.new("UICorner", box).CornerRadius = UDim.new(0, 18)
+                local st = Instance.new("UIStroke", box)
+                st.Color = Color3.fromRGB(255, 69, 58)
+                st.Transparency = 0.4
+                local t1 = Instance.new("TextLabel")
+                t1.Size = UDim2.new(1, -24, 0, 22)
+                t1.Position = UDim2.new(0, 12, 0, 10)
+                t1.BackgroundTransparency = 1
+                t1.Font = Enum.Font.GothamBold
+                t1.TextSize = 15
+                t1.TextColor3 = Color3.fromRGB(255, 90, 90)
+                t1.TextXAlignment = Enum.TextXAlignment.Left
+                t1.Text = "Byakugan failed to start"
+                t1.Parent = box
+                local t2 = Instance.new("TextLabel")
+                t2.Size = UDim2.new(1, -24, 1, -44)
+                t2.Position = UDim2.new(0, 12, 0, 36)
+                t2.BackgroundTransparency = 1
+                t2.Font = Enum.Font.Gotham
+                t2.TextSize = 12
+                t2.TextWrapped = true
+                t2.TextColor3 = Color3.fromRGB(235, 235, 240)
+                t2.TextXAlignment = Enum.TextXAlignment.Left
+                t2.TextYAlignment = Enum.TextYAlignment.Top
+                t2.Text = tostring(msg)
+                t2.Parent = box
+        end)
+end
+
+xpcall(function()
+
+-- ============================================================
+-- [1] SERVICES + EXECUTOR PROBES
+-- ============================================================
+local Players          = game:GetService("Players")
+local Workspace        = game:GetService("Workspace")
+local RunService       = game:GetService("RunService")
+local Stats            = game:GetService("Stats")
+local TweenService     = game:GetService("TweenService")
+local UserInputService = game:GetService("UserInputService")
+
+local LocalPlayer = Players.LocalPlayer
+
+local get_connections = (typeof(getconnections) == "function" and getconnections)
+        or (typeof(get_signal_cons) == "function" and get_signal_cons) or nil
+local fire_signal = (typeof(firesignal) == "function" and firesignal)
+        or (typeof(fire_signal) == "function" and fire_signal) or nil
+local get_gc  = (typeof(getgc) == "function" and getgc) or nil
+local rawMeta = (typeof(getrawmetatable) == "function" and getrawmetatable) or nil
+local setRo   = (typeof(setreadonly) == "function" and setreadonly) or nil
+local hookSupported = (get_gc and rawMeta and setRo) ~= nil
+local unpack = unpack or table.unpack
+
+local isMobileDevice = false
+do
+        local touch = UserInputService.TouchEnabled
+        local mouse = UserInputService.MouseEnabled
+        local keyboard = UserInputService.KeyboardEnabled
+        isMobileDevice = (touch and not keyboard) or (touch and not mouse)
+end
+bootSay("[BYAK 2/6] state + engine…")
+
+-- ============================================================
+-- [2] STATE
+-- ============================================================
+local isRunning        = true         -- auto parry ON at boot
+local dotEnabled       = true
+local auraEnabled      = true
+local autoSpamEnabled  = true         -- NEW: 15-stud auto spam
+local fxEnabled        = true         -- parry shockwave FX
+local perfMode         = false        -- HIGH PERFORMANCE mode
+local parryMethod      = "Auto"       -- Auto | Hook | Button | Signal | Remote
+local parryCurve       = "Camera"     -- NAZK curve list
+
+local renderConn   = nil
+local screenGui    = nil
+local frameCount   = 0
+local totalFires   = 0
+local hookFires    = 0
+local lastFireMethod = "none"
+local lastResult     = "—"
+local lastFireAt     = 0
+local lastSpamAt     = 0
+local spamFireCount  = 0
+local spamActive     = false         -- auto-spam engaged state
+local spamFires      = 0             -- fires in the CURRENT engagement
+local spamCooldownUntil = 0          -- re-arm delay between engagements
+local lastAutoFireAt = 0             -- shared throttle: ANY auto fire
+local parriedUntil   = 0
+local parryRetries   = 0
+local lastTtiBucket  = -1        -- anti-garbage TTI text bucket
+local lastTargetOf   = {}
+local deathActive    = false
+local infActive      = false
+local pingMs         = 0
+
+-- every connection / task flag that must die on unload
+local liveConns = {}
+local uiAlive   = true
+
+-- forward declarations (assigned later)
+local fxBurst = nil    -- parry shockwave (UI assigns)
+local unloadFn = nil   -- full unload (UI assigns)
+local applyPerfUI = nil -- perf-mode UI gate (UI assigns)
+
+-- ============================================================
+-- [3] STATUS MACHINE (island + footer read from here)
+-- ============================================================
+local statusBase, transientText, transientUntil = "Idle", nil, 0
+
+local function pushStatus(text, duration)
+        transientText  = text
+        transientUntil = os.clock() + (duration or 0.6)
+end
+local function setBaseStatus(text)
+        statusBase = text
+end
+local function resolvedStatus()
+        if transientText and os.clock() < transientUntil then
+                return transientText
+        end
+        return statusBase
+end
+
+-- ============================================================
+-- [4] LAZY WORLD RESOLVERS (never block the boot)
+-- ============================================================
+local ballsFolder, remotesFolder
+local function getBalls()
+        if ballsFolder and ballsFolder.Parent then return ballsFolder end
+        ballsFolder = Workspace:FindFirstChild("Balls")
+        return ballsFolder
+end
+local function getRemotes()
+        if remotesFolder and remotesFolder.Parent then return remotesFolder end
+        local ok, rs = pcall(function() return game:GetService("ReplicatedStorage") end)
+        if not ok or not rs then return nil end
+        remotesFolder = rs:FindFirstChild("Remotes")
+        return remotesFolder
+end
+
+-- ============================================================
+-- [4b] PING CORE — player ping + client ping + machine delay
+-- ============================================================
+local playerPingSec   = 0.08     -- GetNetworkPing (seconds)
+local dataPingMs      = 0        -- "Data Ping" stat (ms)
+local machineDelaySec = 1 / 60   -- smoothed frame pipeline delay
+
+local function getPingMs()
+        local ok, v = pcall(function()
+                return Stats.Network.ServerStatsItem["Data Ping"]:GetValue()
+        end)
+        if ok and v and v > 0 then dataPingMs = v end
+        return dataPingMs
+end
+
+local function getPlayerPingSec()
+        local ok, v = pcall(function() return LocalPlayer:GetNetworkPing() end)
+        if ok and type(v) == "number" and v > 0 then playerPingSec = v end
+        return playerPingSec
+end
+
+-- machine delay: smoothed RenderStepped delta (the whole render
+-- + script pipeline stall — packets are late by at least this)
+do
+        local machineConn = RunService.RenderStepped:Connect(function(dt)
+                if dt and dt > 0 then
+                        local d = math.clamp(dt, 0.001, 0.25)
+                        machineDelaySec = machineDelaySec + (d - machineDelaySec) * 0.08
+                end
+        end)
+        table.insert(liveConns, machineConn)
+end
+
+-- THE FORMULA — parry_time_offset =
+--   2 x (playerPing + clientPing + machineDelay), capped for sanity
+local function getParryTimeOffset()
+        local clientPing = getPingMs() / 1000
+        local offset = 2 * (getPlayerPingSec() + clientPing + machineDelaySec)
+        return math.clamp(offset, 0, 0.5)
+end
+
+-- ============================================================
+-- [5] BALL HELPERS
+-- ============================================================
+local function setupAura()
+        local char = LocalPlayer.Character
+        if not char then return end
+        local hl = char:FindFirstChild("ByakuganAura")
+        if not hl then
+                hl = Instance.new("Highlight")
+                hl.Name = "ByakuganAura"
+                hl.FillColor = Color3.fromRGB(200, 0, 0)
+                hl.OutlineColor = Color3.fromRGB(255, 50, 50)
+                hl.FillTransparency = 0.85
+                hl.OutlineTransparency = 0
+                hl.Enabled = auraEnabled
+                hl.Parent = char
+        end
+end
+
+local serverBallDot = Instance.new("Part")
+serverBallDot.Shape = Enum.PartType.Ball
+serverBallDot.Anchored = true
+serverBallDot.CanCollide = false
+serverBallDot.CanQuery = false
+serverBallDot.CanTouch = false
+serverBallDot.Material = Enum.Material.Neon
+serverBallDot.Color = Color3.fromRGB(255, 255, 0)
+serverBallDot.Size = Vector3.new(1.5, 1.5, 1.5)
+serverBallDot.Transparency = dotEnabled and 0 or 1
+serverBallDot.Parent = Workspace
+
+setupAura()
+do
+        local auraConn = LocalPlayer.CharacterAdded:Connect(function()
+                task.wait(1)
+                if uiAlive then setupAura() end
+        end)
+        table.insert(liveConns, auraConn)
+end
+
+local function ballVelocity(ball)
+        local ok, v = pcall(function()
+                local z = ball:FindFirstChild("zoomies")
+                if z then return z.VectorVelocity end
+                return ball.AssemblyLinearVelocity
+        end)
+        if ok and v then return v end
+        return Vector3.new()
+end
+
+local function getActiveBall()
+        local folder = getBalls()
+        if not folder then return nil end
+        local best, bestSpeed = nil, 0
+        for _, ball in pairs(folder:GetChildren()) do
+                if ball:IsA("BasePart") then
+                        if ball:GetAttribute("realBall") == true then
+                                return ball
+                        end
+                        local sp = ballVelocity(ball).Magnitude
+                        if sp > bestSpeed then bestSpeed, best = sp, ball end
+                end
+        end
+        if bestSpeed > 25 then return best end
+        return nil
+end
+
+-- the player the ball is currently homing at (or nil)
+local function ballTargetPlayer(ball)
+        local ok, name = pcall(function() return ball:GetAttribute("target") end)
+        if not ok or type(name) ~= "string" then return nil end
+        local plr = Players:FindFirstChild(name)
+        if not plr then return nil end
+        local char = plr.Character
+        if not char then return nil end
+        return plr, char:FindFirstChild("HumanoidRootPart")
+end
+
+-- ============================================================
+-- [6] HOOK ENGINE — token + capture (NAZK exact)
+-- ============================================================
+local hookState = {
+        tokenFn = nil, tokenOk = false,
+        captured = nil, capturedArgs = nil,
+        captureCount = 0, path = "none", announced = false,
+}
+local hookMetas, hookStored = {}, {}
+
+local function sourceNameOf(f)
+        local ok, s = pcall(function()
+                if type(debug) == "table" and type(debug.info) == "function" then
+                        return debug.info(f, "s")
+                end
+                return nil
+        end)
+        if ok and type(s) == "string" then return s end
+        return nil
+end
+
+local function upvalsOf(f)
+        local ok, ups = pcall(function()
+                if type(debug) == "table" and type(debug.getupvalues) == "function" then
+                        return debug.getupvalues(f)
+                end
+                return nil
+        end)
+        if ok and type(ups) == "table" then return ups end
+        return nil
+end
+
+-- v26.5: single-flight guard — installHook, the boot animation and
+-- the diag panel all call this; two concurrent getgc scans would
+-- double-freeze the VM on busy servers.
+local scanBusy = false
+local function findTokenFunction()
+        if hookState.tokenOk then return true end
+        if not get_gc then return false end
+        if scanBusy then return false end
+        scanBusy = true
+        local found
+        local scanned = 0
+        pcall(function()
+                for _, obj in get_gc(true) do
+                        scanned = scanned + 1
+                        if scanned % 1000 == 0 then
+                                -- v26.5: yield to the scheduler — on old,
+                                -- bloated servers the no-yield scan froze the
+                                -- whole boot for 30+ s. Same objects, same
+                                -- token found, just without starving the VM.
+                                task.wait()
+                        end
+                        if type(obj) == "function" then
+                                local src = sourceNameOf(obj)
+                                if src and src:find("PRY", 1, true) then
+                                        local ups = upvalsOf(obj)
+                                        if ups then
+                                                for _, v in pairs(ups) do
+                                                        if type(v) == "function" then found = v break end
+                                                end
+                                        end
+                                end
+                        end
+                        if found then break end
+                end
+        end)
+        scanBusy = false
+        if found then
+                hookState.tokenFn = found
+                hookState.tokenOk = true
+        end
+        return hookState.tokenOk
+end
+
+-- Blade Ball's tokenizer: time string XOR'd with the PRY key
+local function parryToken(remoteUid)
+        if not hookState.tokenOk then return nil end
+        local ok, token = pcall(function()
+                local time = tostring(math.floor(Workspace:GetServerTimeNow() * 100))
+                local key = hookState.tokenFn(remoteUid, "TIME")
+                if type(key) ~= "string" or #key == 0 then return nil end
+                local chars = table.create(#time)
+                for i = 1, #time do
+                        chars[i] = string.char(bit32.bxor(
+                                (string.byte(time, i) + i) % 256,
+                                string.byte(key, (i - 1) % #key + 1)
+                        ))
+                end
+                return table.concat(chars)
+        end)
+        if ok then return token end
+        return nil
+end
+
+local function hookRemote(remote)
+        if not hookSupported or not remote then return end
+        if not remote:IsA("RemoteEvent") and not remote:IsA("RemoteFunction") then return end
+        local meta = rawMeta(remote)
+        if not meta or hookMetas[meta] then return end
+        hookMetas[meta] = true
+        pcall(function()
+                setRo(meta, false)
+                local oldIndex = meta.__index
+                meta.__index = function(self, key)
+                        if (key == "FireServer" and self:IsA("RemoteEvent"))
+                                or (key == "InvokeServer" and self:IsA("RemoteFunction")) then
+                                return function(_, ...)
+                                        local args = { ... }
+                                        if #args >= 8 and not hookStored[self] then
+                                                hookStored[self] = args
+                                                hookState.captureCount = hookState.captureCount + 1
+                                                local isParry = self.Name:lower():find("parry", 1, true) ~= nil
+                                                local stale = hookState.captured ~= nil
+                                                        and hookState.captured.Parent == nil
+                                                if isParry or not hookState.captured or stale then
+                                                        hookState.captured = self
+                                                        hookState.capturedArgs = args
+                                                        pcall(function() hookState.path = self:GetFullName() end)
+                                                end
+                                                if not hookState.announced then
+                                                        hookState.announced = true
+                                                        pushStatus("Hook armed", 1.6)
+                                                end
+                                        end
+                                        return oldIndex(self, key)(_, unpack(args))
+                                end
+                        end
+                        return oldIndex(self, key)
+                end
+                setRo(meta, true)
+        end)
+end
+
+local hookInstalled = false
+local function installHook()
+        if hookInstalled then return hookSupported end
+        hookInstalled = true
+        findTokenFunction()
+        if hookSupported then
+                local ok, rs = pcall(function() return game:GetService("ReplicatedStorage") end)
+                if ok and rs then
+                        pcall(function()
+                                for _, inst in pairs(rs:GetDescendants()) do
+                                        if inst:IsA("RemoteEvent") or inst:IsA("RemoteFunction") then
+                                                hookRemote(inst)
+                                        end
+                                end
+                        end)
+                end
+        end
+        return hookSupported
+end
+task.spawn(installHook)
+
+-- Also hook remotes that appear later (Knit loads async)
+task.spawn(function()
+        local ok, rs = pcall(function() return game:GetService("ReplicatedStorage") end)
+        if not ok or not rs then return end
+        pcall(function()
+                rs.DescendantAdded:Connect(function(inst)
+                        if inst:IsA("RemoteEvent") or inst:IsA("RemoteFunction") then
+                                task.defer(hookRemote, inst)
+                        end
+                end)
+        end)
+end)
+
+-- ============================================================
+-- [7] NAZK CURVE SYSTEM (all 11 modes) + curve detection
+-- ============================================================
+local curveProps = { lerpRadians = 0, lastWarping = 0, curving = 0, ball = nil }
+
+local function getCurveTarget()
+        local cam = Workspace.CurrentCamera
+        local char = LocalPlayer.Character
+        local root = char and char:FindFirstChild("HumanoidRootPart")
+        local rootPos = root and root.Position or (cam and cam.CFrame.Position) or Vector3.new()
+        local targetPart, bestDist = nil, math.huge
+        local mouseLoc = nil
+        if not isMobileDevice then
+                pcall(function() mouseLoc = UserInputService:GetMouseLocation() end)
+        end
+        local alive = Workspace:FindFirstChild("Alive")
+        if cam and alive then
+                for _, v in pairs(alive:GetChildren()) do
+                        if v ~= char and v.PrimaryPart then
+                                local ok, sp = pcall(function() return cam:WorldToScreenPoint(v.PrimaryPart.Position) end)
+                                if ok and sp then
+                                        local dist
+                                        if mouseLoc then
+                                                dist = (Vector2.new(sp.X, sp.Y) - mouseLoc).Magnitude
+                                        else
+                                                local center = Vector2.new(cam.ViewportSize.X / 2, cam.ViewportSize.Y / 2)
+                                                dist = (Vector2.new(sp.X, sp.Y) - center).Magnitude
+                                        end
+                                        if dist < bestDist then bestDist, targetPart = dist, v.PrimaryPart end
+                                end
+                        end
+                end
+        end
+        local targetPos = targetPart and targetPart.Position
+                or (rootPos + ((cam and cam.CFrame.LookVector) or Vector3.new()) * 100)
+        return cam, rootPos, targetPos
+end
+
+local function getCurveCFrame()
+        local cam, rootPos, targetPos = getCurveTarget()
+        if not cam then return CFrame.new(rootPos) end
+        local mode = parryCurve
+        local cf
+        if mode == "Camera" then
+                cf = cam.CFrame
+        elseif mode == "Random" then
+                local direction = (targetPos - rootPos).Unit
+                local offset, dot, attempts = Vector3.new(), 1, 0
+                repeat
+                        offset = Vector3.new(math.random(-4000, 4000), math.random(-4000, 4000), math.random(-4000, 4000))
+                        dot = direction:Dot((targetPos + offset - rootPos).Unit)
+                        attempts = attempts + 1
+                until dot < 0.95 or attempts > 10
+                cf = CFrame.new(rootPos, targetPos + offset)
+        elseif mode == "Accelerated" then
+                cf = CFrame.new(rootPos, targetPos + Vector3.new(0, 5, 0))
+        elseif mode == "Backwards" then
+                local direction = (rootPos - targetPos).Unit
+                cf = CFrame.new(cam.CFrame.Position, rootPos + direction * 10000 + Vector3.new(0, 1000, 0))
+        elseif mode == "Slow" then
+                cf = CFrame.new(rootPos, targetPos + Vector3.new(0, -9e18, 0))
+        elseif mode == "High" then
+                cf = CFrame.new(rootPos, targetPos + Vector3.new(0, 9e18, 0))
+        elseif mode == "Normal" then
+                local char = LocalPlayer.Character
+                local root = char and char:FindFirstChild("HumanoidRootPart")
+                cf = CFrame.new(rootPos, rootPos + (root and root.CFrame.LookVector or cam.CFrame.LookVector))
+        elseif mode == "Speed" then
+                cf = CFrame.new(cam.CFrame.Position, cam.CFrame.Position + cam.CFrame.UpVector * 5)
+        elseif mode == "Down" then
+                cf = CFrame.new(cam.CFrame.Position, cam.CFrame.Position + cam.CFrame.UpVector * -9e9)
+        elseif mode == "Left" then
+                cf = CFrame.new(cam.CFrame.Position, cam.CFrame.Position - cam.CFrame.RightVector * 9e9)
+        elseif mode == "Right" then
+                cf = CFrame.new(cam.CFrame.Position, cam.CFrame.Position + cam.CFrame.RightVector * 9e9)
+        else
+                cf = cam.CFrame
+        end
+        return cf
+end
+
+local function isCurved(ball, pingSec)
+        local zoomies = ball:FindFirstChild("zoomies")
+        if not zoomies then return false end
+        local velocity = zoomies.VectorVelocity
+        local speed = velocity.Magnitude
+        if speed < 1 then return false end
+        local char = LocalPlayer.Character
+        local root = char and char:FindFirstChild("HumanoidRootPart")
+        if not root then return false end
+        if curveProps.ball ~= ball then
+                curveProps.ball = ball
+                curveProps.lerpRadians = 0
+        end
+        local direction = (root.Position - ball.Position).Unit
+        local dot = direction:Dot(velocity.Unit)
+        local distance = (root.Position - ball.Position).Magnitude
+        local reachTime = distance / speed - pingSec
+        local dotThreshold = math.clamp(0.55 - pingSec * 0.75, -1, 0.45)
+        local speedThreshold = math.min(speed / 100, 45)
+        local distThreshold = 15 - math.min(distance / 1000, 15) + speedThreshold
+        local radians = math.asin(math.clamp(dot, -1, 1))
+        curveProps.lerpRadians = curveProps.lerpRadians + (radians - curveProps.lerpRadians) * 0.85
+        if curveProps.lerpRadians < 0.016 then curveProps.lastWarping = os.clock() end
+        if distance < distThreshold * 0.85 then return false end
+        -- v26.1: cap the veto windows — at long range reachTime is
+        -- huge and the old math kept the parry deaf for seconds.
+        if os.clock() - curveProps.lastWarping < math.min(reachTime / 1.4, 1.2) then return true end
+        if os.clock() - curveProps.curving < math.min(reachTime / 1.1, 1.2) then return true end
+        return dot < dotThreshold
+end
+
+-- NAZK parry-accuracy radius: ping + speed derived
+local function parryAccuracy(speed, pingSec)
+        local pingThreshold = math.clamp(pingSec * 10, 5, 20)
+        local capped = math.min(math.max(speed - 9.5, 0), 900)
+        local divisor = 2.4 + capped * 0.0018
+        return pingThreshold + math.max(speed / divisor, 9.5)
+end
+
+-- ============================================================
+-- [7b] LONG-RANGE HS — TTI interception core (v26.1)
+-- ============================================================
+-- Per-ball velocity tracking -> ACCELERATION estimate, so the
+-- server-ball extrapolation follows CURVED flight instead of a
+-- straight line that lies more the further the ball is.
+local ballVelTrack = {}
+local function serverBallPos(ball, zoomies, offset)
+        local vel = zoomies.VectorVelocity
+        local now = os.clock()
+        local acc = Vector3.zero
+        local prev = ballVelTrack[ball]
+        if prev then
+                local dt = now - prev.t
+                if dt > 0.001 and dt < 0.25 then
+                        acc = (vel - prev.v) / dt
+                        local am = acc.Magnitude
+                        if am > 600 then
+                                acc = acc * (600 / am)
+                        end
+                end
+        end
+        ballVelTrack[ball] = { v = vel, t = now }
+        -- occasional sweep of destroyed balls (tiny state, stays tiny)
+        if math.random(1, 120) == 1 then
+                for b in pairs(ballVelTrack) do
+                        if not b.Parent then ballVelTrack[b] = nil end
+                end
+        end
+        return ball.Position + vel * offset + acc * (offset * offset * 0.5)
+end
+
+-- Fire window: how many seconds BEFORE impact we release the
+-- parry so the request lands inside the server's validation
+-- window. v26.4: the trigger measures the REAL ball now (the
+-- phantom-ball subtraction is gone), so the window must be the
+-- pure send lead = 1 x (pings + machine) — HALF the offset
+-- formula. Its other half used to hide inside the phantom
+-- subtraction, double-counting the lead (fires ~1 s early).
+local function ttiFireWindow(speed)
+        local w = getParryTimeOffset() * 0.5 + 0.05 + speed / 6000
+        return math.clamp(w, 0.08, 0.42)
+end
+
+-- Adaptive cooldown: fast balls re-arm FAST so a wasted early
+-- fire can be corrected before contact; slow balls stay quiet.
+-- (Guaranteed shorter than the panic window: refire is reachable.)
+local function parryCooldown(speed)
+        return math.clamp(0.5 - speed / 1600, 0.14, 0.5)
+end
+
+-- ============================================================
+-- [8] FIRING CHAIN — hook replay -> button -> remote
+-- ============================================================
+local function fireParryRemote(curveCF)
+        if not hookState.captured or not hookState.capturedArgs then return false end
+        local ok, did = pcall(function()
+                local cam = Workspace.CurrentCamera
+                local aim
+                if isMobileDevice then
+                        local vp = cam.ViewportSize
+                        aim = { math.floor(vp.X / 2), math.floor(vp.Y / 2) }
+                else
+                        local mok, mouse = pcall(function() return UserInputService:GetMouseLocation() end)
+                        if mok and mouse then
+                                aim = { math.floor(mouse.X), math.floor(mouse.Y) }
+                        else
+                                local vp = cam.ViewportSize
+                                aim = { math.floor(vp.X / 2), math.floor(vp.Y / 2) }
+                        end
+                end
+                local eventData = {}
+                local alive = Workspace:FindFirstChild("Alive")
+                if alive then
+                        for _, e in pairs(alive:GetChildren()) do
+                                if e.PrimaryPart then
+                                        local sok, sp = pcall(function() return cam:WorldToScreenPoint(e.PrimaryPart.Position) end)
+                                        if sok and sp then eventData[e.Name] = sp end
+                                end
+                        end
+                end
+                local args = hookState.capturedArgs
+                local packet = {
+                        args[1], args[2], parryToken(args[2]), 0.5,
+                        curveCF or cam.CFrame, eventData, aim, false,
+                }
+                if hookState.captured:IsA("RemoteEvent") then
+                        hookState.captured:FireServer(unpack(packet))
+                else
+                        hookState.captured:InvokeServer(unpack(packet))
+                end
+                return true
+        end)
+        if ok and did then
+                hookFires = hookFires + 1
+                totalFires = totalFires + 1
+                lastFireMethod = "hook replay"
+                lastFireAt = os.clock()
+                return true
+        end
+        return false
+end
+
+-- --- Block button (used to arm capture + as a fallback method)
+local blockButton, blockScanAt = nil, 0
+local function findBlockButton()
+        local pg = LocalPlayer:FindFirstChild("PlayerGui")
+        if not pg then return nil end
+        local hotbar = pg:FindFirstChild("Hotbar")
+        if hotbar then
+                local direct = hotbar:FindFirstChild("Block")
+                if direct and direct:IsA("GuiButton") then return direct end
+        end
+        local best, bestY = nil, math.huge
+        for _, v in pairs(pg:GetDescendants()) do
+                if v:IsA("GuiButton") and v.Visible then
+                        local n = v.Name:lower()
+                        if n:find("block", 1, true) or n:find("parry", 1, true) or n:find("fight", 1, true) then
+                                local ok, pos = pcall(function() return v.AbsolutePosition end)
+                                if ok and pos.Y < bestY then bestY, best = pos.Y, v end
+                        end
+                end
+        end
+        return best
+end
+local function getBlockButton()
+        local now = os.clock()
+        if blockButton and blockButton.Parent and now - blockScanAt < 3 then
+                return blockButton
+        end
+        blockScanAt = now
+        blockButton = findBlockButton()
+        return blockButton
+end
+
+local function fireButtonChain()
+        local btn = getBlockButton()
+        if not btn then return false end
+        local fired = false
+        if get_connections then
+                pcall(function()
+                        for _, sig in ipairs({ btn.Activated, btn.MouseButton1Click, btn.MouseButton1Down, btn.TouchTap }) do
+                                for _, c in pairs(get_connections(sig)) do
+                                        pcall(function() c.Fire(c) end)
+                                        fired = true
+                                end
+                        end
+                end)
+        end
+        if fire_signal then
+                pcall(function()
+                        fire_signal(btn.Activated)
+                        fired = true
+                end)
+        end
+        if fired then
+                lastFireMethod = "button"
+                lastFireAt = os.clock()
+        end
+        return fired
+end
+
+-- --- Last-resort: ParryAttempt FireServer variants
+local parryRemoteCache
+local function getParryRemote()
+        if parryRemoteCache and parryRemoteCache.Parent then return parryRemoteCache end
+        local remotes = getRemotes()
+        if not remotes then return nil end
+        parryRemoteCache = remotes:FindFirstChild("ParryAttempt")
+        return parryRemoteCache
+end
+local function remoteFireVariants()
+        local remote = getParryRemote()
+        if not remote then return false end
+        local sent = false
+        pcall(function() remote:FireServer() sent = true end)
+        if not sent then
+                pcall(function() remote:FireServer(0.5) sent = true end)
+        end
+        if not sent then
+                pcall(function() remote:FireServer(true) sent = true end)
+        end
+        if sent then
+                lastFireMethod = "remote"
+                lastFireAt = os.clock()
+        end
+        return sent
+end
+
+local function fireSelected()
+        totalFires = totalFires + 1
+        lastFireAt = os.clock()
+        local m = parryMethod
+        if m == "Hook" or m == "Auto" then
+                if fireParryRemote(getCurveCFrame()) then
+                        lastResult = "hook"
+                        pushStatus("Hook fired", 0.5)
+                        return
+                end
+                if m == "Hook" then
+                        if not hookState.captured then
+                                lastResult = "arming…"
+                                fireButtonChain() -- makes the GAME fire the real packet
+                        else
+                                lastResult = "hook err"
+                        end
+                        return
+                end
+        end
+        if (m == "Auto" or m == "Button") and fireButtonChain() then
+                lastResult = "button"
+                return
+        end
+        if m == "Auto" or m == "Signal" then
+                local btn = getBlockButton()
+                if btn and fire_signal then
+                        local ok = pcall(function() fire_signal(btn.Activated) end)
+                        if ok then
+                                lastFireMethod = "signal"
+                                lastResult = "signal"
+                                return
+                        end
+                end
+        end
+        if m == "Auto" or m == "Remote" then
+                if remoteFireVariants() then
+                        lastResult = "remote"
+                        return
+                end
+        end
+        lastResult = "no path"
+end
+
+-- ============================================================
+-- [9] REACTIVE LAYER — ParrySuccessAll curve responder (NAZK)
+-- ============================================================
+task.spawn(function()
+        local remotes
+        for _ = 1, 30 do
+                remotes = getRemotes()
+                if remotes then break end
+                task.wait(1)
+        end
+        if not remotes then return end
+
+        local function onParrySuccessAll(_, b)
+                pcall(function()
+                        -- bookmark curves that are NOT coming to us (NAZK)
+                        local char = LocalPlayer.Character
+                        local root = char and char:FindFirstChild("HumanoidRootPart")
+                        local ball = getActiveBall()
+                        if root and ball and b ~= root and b ~= char then
+                                local zoomies = ball:FindFirstChild("zoomies")
+                                if zoomies and zoomies.VectorVelocity.Magnitude > 1 then
+                                        local distance = (root.Position - ball.Position).Magnitude
+                                        if distance > parryAccuracy(zoomies.VectorVelocity.Magnitude, getPingMs() / 1000) then
+                                                curveProps.curving = os.clock()
+                                        end
+                                end
+                        end
+                        -- reactive parry: a parry just resolved next to us and the
+                        -- ball is curving onto us — fire NOW (proactive math lies)
+                        if not isRunning then return end
+                        local ch = LocalPlayer.Character
+                        local rt = ch and ch:FindFirstChild("HumanoidRootPart")
+                        local bl = getActiveBall()
+                        local alive = Workspace:FindFirstChild("Alive")
+                        if not (bl and rt and alive) then return end
+                        local closest, closestDist = nil, math.huge
+                        for _, e in pairs(alive:GetChildren()) do
+                                if e ~= ch and e.PrimaryPart then
+                                        local ok, d = pcall(function() return LocalPlayer:DistanceFromCharacter(e.PrimaryPart.Position) end)
+                                        if ok and d < closestDist then closestDist, closest = d, e end
+                                end
+                        end
+                        if not closest then return end
+                        local zoomies = bl:FindFirstChild("zoomies")
+                        if not zoomies then return end
+                        local v = zoomies.VectorVelocity
+                        if v.Magnitude < 1 then return end
+                        local targetDist = (rt.Position - closest.PrimaryPart.Position).Magnitude
+                        local dist = (rt.Position - bl.Position).Magnitude
+                        local dot = ((rt.Position - bl.Position).Unit):Dot(v.Unit)
+                        if targetDist < 15 and dist < 15 and dot > -0.25 and isCurved(bl, getPingMs() / 1000) then
+                                pushStatus("Parrying", 0.8)
+                                fireSelected()
+                        end
+                end)
+        end
+        pcall(function() remotes.ParrySuccessAll.OnClientEvent:Connect(onParrySuccessAll) end)
+        pcall(function()
+                remotes.DeathBall.OnClientEvent:Connect(function(_, d) deathActive = d and true or false end)
+        end)
+        pcall(function()
+                remotes.InfinityBall.OnClientEvent:Connect(function(_, b) infActive = b and true or false end)
+        end)
+end)
+
+-- ============================================================
+-- [10] UI KIT — RS theme × iOS 26 liquid-glass motion
+-- ============================================================
+local THEME = {
+        Red       = Color3.fromRGB(187, 10, 48),  -- Audi Tango Red
+        RedGlow   = Color3.fromRGB(255, 45, 70),
+        Carbon    = Color3.fromRGB(9, 9, 12),     -- v26.2: deeper dark
+        Panel     = Color3.fromRGB(16, 16, 20),
+        PanelDark = Color3.fromRGB(13, 13, 16),
+        Hover     = Color3.fromRGB(24, 24, 29),
+        Stroke    = Color3.fromRGB(38, 38, 45),
+        Text      = Color3.fromRGB(238, 238, 240),
+        TextDim   = Color3.fromRGB(120, 120, 128),
+        Glass     = Color3.fromRGB(255, 255, 255),
+        Amber     = Color3.fromRGB(255, 159, 10),
+        Good      = Color3.fromRGB(52, 199, 89),
+        Bad       = Color3.fromRGB(255, 69, 58),
+}
+
+local function create(className, props, children)
+        local inst = Instance.new(className)
+        for k, v in pairs(props or {}) do inst[k] = v end
+        for _, child in ipairs(children or {}) do child.Parent = inst end
+        return inst
+end
+local function corner(inst, r)
+        return create("UICorner", { CornerRadius = UDim.new(0, r), Parent = inst })
+end
+local function fullCorner(inst)
+        return create("UICorner", { CornerRadius = UDim.new(1, 0), Parent = inst })
+end
+local function stroke(inst, color, thickness, transparency)
+        return create("UIStroke", { Color = color, Thickness = thickness, Transparency = transparency, Parent = inst })
+end
+local function tw(inst, time, props, style, dir, repeats, reverses)
+        return TweenService:Create(inst, TweenInfo.new(
+                time, style or Enum.EasingStyle.Quint, dir or Enum.EasingDirection.Out,
+                repeats or 0, reverses or false), props)
+end
+-- elastic pop on any UIScale (the iOS 26 "squish")
+local popTokens = {}
+local function elasticPop(scaleObj, strength)
+        if not scaleObj or not scaleObj.Parent then return end
+        local id = popTokens[scaleObj]
+        popTokens[scaleObj] = (id or 0) + 1
+        scaleObj.Scale = strength
+        tw(scaleObj, 0.7, { Scale = 1 }, Enum.EasingStyle.Elastic):Play()
+end
+local function sheen(parent, height, radius)
+        local s = create("Frame", {
+                Size = UDim2.new(1, 0, 0, height),
+                BackgroundColor3 = THEME.Glass, BorderSizePixel = 0, Parent = parent,
+        })
+        corner(s, radius)
+        create("UIGradient", {
+                Rotation = 90,
+                Transparency = NumberSequence.new({
+                        NumberSequenceKeypoint.new(0, 0.9),
+                        NumberSequenceKeypoint.new(1, 1),
+                }),
+                Parent = s,
+        })
+        return s
+end
+local function pressScale(btn, dip)
+        local s = create("UIScale", { Scale = 1, Parent = btn })
+        btn.InputBegan:Connect(function(input)
+                if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+                        tw(s, 0.08, { Scale = dip }, Enum.EasingStyle.Quad):Play()
+                end
+        end)
+        btn.InputEnded:Connect(function(input)
+                if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+                        tw(s, 0.45, { Scale = 1 }, Enum.EasingStyle.Elastic):Play()
+                end
+        end)
+        return s
+end
+local function pressTint(row, tint, pressT, baseT)
+        row.InputBegan:Connect(function(input)
+                if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+                        tw(tint, 0.08, { BackgroundTransparency = pressT }, Enum.EasingStyle.Quad):Play()
+                end
+        end)
+        row.InputEnded:Connect(function(input)
+                if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+                        tw(tint, 0.25, { BackgroundTransparency = baseT or 0 }, Enum.EasingStyle.Quad):Play()
+                end
+        end)
+end
+
+-- ============================================================
+-- [11] SCREENGUI + PARRY SHOCKWAVE LAYER + MAIN SHELL
+-- ============================================================
+bootSay("[BYAK 3/6] building UI…")
+screenGui = create("ScreenGui", {
+        Name = "ByakuganRS_HUD",
+        ResetOnSpawn = false,
+        IgnoreGuiInset = true,
+        ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+        DisplayOrder = 9999,
+})
+local parentedOk = pcall(function()
+        screenGui.Parent = (typeof(gethui) == "function" and gethui()) or game:GetService("CoreGui")
+end)
+if not parentedOk then
+        screenGui.Parent = LocalPlayer:WaitForChild("PlayerGui", 10)
+end
+bootSay("[BYAK 4/6] HUD shell…")
+
+-- full-screen edge glow that flashes on every parry (toggleable)
+local fxGroup = create("CanvasGroup", {
+        Name = "ParryShockwave", Size = UDim2.new(1, 0, 1, 0),
+        BackgroundTransparency = 1, BorderSizePixel = 0,
+        GroupTransparency = 1, ZIndex = 5, Parent = screenGui,
+})
+do
+        local edges = {
+                { Size = UDim2.new(1, 0, 0, 110), Pos = UDim2.new(0, 0, 0, 0),   Rot = 90 },
+                { Size = UDim2.new(1, 0, 0, 110), Pos = UDim2.new(0, 0, 1, -110), Rot = 270 },
+                { Size = UDim2.new(0, 90, 1, 0),  Pos = UDim2.new(0, 0, 0, 0),   Rot = 0 },
+                { Size = UDim2.new(0, 90, 1, 0),  Pos = UDim2.new(1, -90, 0, 0), Rot = 180 },
+        }
+        for _, e in ipairs(edges) do
+                create("Frame", {
+                        Size = e.Size, Position = e.Pos, BackgroundColor3 = THEME.Glass,
+                        BackgroundTransparency = 0.72, BorderSizePixel = 0, Parent = fxGroup,
+                        ZIndex = 5,
+                }, {
+                        create("UIGradient", {
+                                Rotation = e.Rot,
+                                Transparency = NumberSequence.new({
+                                        NumberSequenceKeypoint.new(0, 0.35),
+                                        NumberSequenceKeypoint.new(1, 1),
+                                }),
+                        }),
+                })
+        end
+end
+
+local WIN_W = 302
+local winH = 560 -- final height computed after rows are built
+local HEADER_H, FOOTER_H = 52, 26
+
+local main = create("CanvasGroup", {
+        Name = "Main",
+        AnchorPoint = Vector2.new(0.5, 0.5),
+        Position = UDim2.new(0.5, 0, 0.5, 14),
+        Size = UDim2.fromOffset(WIN_W, winH),
+        BackgroundColor3 = THEME.Carbon,
+        BackgroundTransparency = 0.05,
+        BorderSizePixel = 0,
+        ClipsDescendants = true,
+        GroupTransparency = 1,
+        Visible = false,
+        Parent = screenGui,
+})
+corner(main, 20)
+stroke(main, THEME.RedGlow, 2, 0.9) -- v26.2: slimmer halo, minimal
+local mainStroke = stroke(main, THEME.Red, 1.4, 0.15)
+local strokeGradient = create("UIGradient", {
+        Color = ColorSequence.new({
+                ColorSequenceKeypoint.new(0, THEME.Red),
+                ColorSequenceKeypoint.new(0.5, Color3.fromRGB(64, 64, 74)),
+                ColorSequenceKeypoint.new(1, THEME.Red),
+        }),
+        Parent = mainStroke,
+})
+local strokeGradTween = tw(strokeGradient, 4, { Rotation = 360 }, Enum.EasingStyle.Linear, Enum.EasingDirection.InOut, -1)
+strokeGradTween:Play()
+sheen(main, 24, 20)
+local winScale = create("UIScale", { Scale = 1, Parent = main })
+
+-- ambient red wash drifting behind the glass
+local ambient = create("Frame", {
+        Name = "Ambient", Size = UDim2.new(1, 0, 1, 0),
+        BackgroundColor3 = THEME.Red, BackgroundTransparency = 1,
+        BorderSizePixel = 0, Parent = main, ZIndex = 0,
+})
+local ambientGrad = create("UIGradient", {
+        Color = ColorSequence.new({
+                ColorSequenceKeypoint.new(0, THEME.Red),
+                ColorSequenceKeypoint.new(0.55, THEME.Carbon),
+                ColorSequenceKeypoint.new(1, THEME.Carbon),
+        }),
+        Transparency = NumberSequence.new({
+                NumberSequenceKeypoint.new(0, 0.93),
+                NumberSequenceKeypoint.new(1, 1),
+        }),
+        Rotation = 35, Parent = ambient,
+})
+local ambientGradTween = tw(ambientGrad, 16, { Rotation = 395 }, Enum.EasingStyle.Linear, Enum.EasingDirection.InOut, -1)
+ambientGradTween:Play()
+
+-- fit to phone screens
+local fitFactor, curWinScale = 1, 1
+local function applyFit()
+        local cam = Workspace.CurrentCamera
+        local vp = cam and cam.ViewportSize or Vector2.new(1200, 800)
+        fitFactor = math.clamp(math.min((vp.X - 16) / WIN_W, (vp.Y - 16) / winH), 0.5, 1)
+        winScale.Scale = fitFactor * curWinScale
+end
+applyFit()
 pcall(function()
-local _g=(typeof(gethui)=="function" and gethui())or game:GetService("CoreGui")
-local _b=Instance.new("ScreenGui") _b.Name="ByakBootPing" _b.IgnoreGuiInset=true _b.ResetOnSpawn=false _b.DisplayOrder=999 _b.Parent=_g
-local _t=Instance.new("TextLabel") _t.AnchorPoint=Vector2.new(0.5,0) _t.Position=UDim2.new(0.5,0,0,12) _t.Size=UDim2.new(0,320,0,30)
-_t.BackgroundColor3=Color3.fromRGB(8,8,10) _t.BackgroundTransparency=0.12 _t.TextColor3=Color3.fromRGB(240,240,240) _t.Font=Enum.Font.GothamBold _t.TextSize=12 _t.Text="BYAKUGAN RS26.5 ▸ booting…" _t.Parent=_b
-Instance.new("UICorner",_t).CornerRadius=UDim.new(0,10)
-task.delay(6,function() pcall(function() _b:Destroy() end) end)
-end);
-local _T={"eZCmoKe3l8zH","h8W0xbXa0Nni","yuDg3PTw/QM=","xvkD/eYbFg==","9g4oKwomLjhG","HAooFygEHCEvXSeBeo6Zk5SdsmZ4dM/UytPc8GcMOQ==","NTAxZG5xb4M=","WkhmVWZCC8zNm2U=","bpGNrJ+zuw==","kKe9t77OruPe","ntzL3O3m5/vWChEd9SkwND4=","4ff38wsHFBo=","3RAaFP0yLQ==","CSwoRzpOKl9a","HlFHWlk=","TEdIe4WIhpo=","a2Z3n6Soq6w=","iaG7vp25wcvZ","ltTD1OXe3/Os+fsKFBQa3Tg68kxUSGBp","x9/5/Nv3/wkX","4gUBIBMnLw==","CCcxMUBEPEVO","IkxMOFFlcGprdA==","QmpeeH4=","YoyBiJiEnbG8trfA","gqegtJK+x9PZv9js9/Hy+w==","ssjIxNzY5es=","0efn4/v3BAo=","8AYGAhoWIyk=","DyUlITk1Qkg=","LkREQFhUYWc=","TWNjX3dzgIY=","bIKCfpaSn6U=","gG6Me4xogYWTwYvl7eH787XHww8fHyg0MrZbiA==","hcDGyA==","psve3fHn","8Pj+/A==","gyhD","CSs6Og==","IUdZYG4=","UGp8f4OEiaOboZe/wcvBztM=","b4mYoa2lug==","gKS+snivz9vb","ydfW0tzw","vPrp+gsEBRnzLjIo","4QkOFiElKjJF","+jgnOElCQ1cxbHBm","Jz9XYA==","cGxzeHt+kw==","V32Wj4GZsbo=","pqCjtZK4ytE=","x7vTz9Tq","5e3y8Pz8","2Q0MBxsjJCYbP0ZSNU1lbg==","HiYsKg==","Qzc/UFA=","VGpqZn56h40=","gA==","n6esqra2","v7O7zMw=","0Obm4vr2Awk=","/fH5Cgo=","DiQkIDg0QUc=","FyAu","TGJiXnZyf4U=","WVVgXw==","l5+koq6u","la++x9PLsurg8P0=","tM7d5vLq0ggIBBwYJSs=","x/EB+/AJHSgeMg==","8gwbJDAoD0c9TVo=","CDRDQ0ZHPFVpdGp+","MEpZYm5mToSEgJiUoac=","bWV9hJI=","ZJKZnFiguLq5vw==","jae5vMDBxuDY3tT8/gj+CxA=","rMbV3uriyQH3BxQ=","y+X0/QkB6R8fGzMvPEI=","6gQWGR0eIz01OzFZW2VbaG0=","CSMyO0c/Jl5UZHE=","KEJRWmZeRnx8eJCMmZ8=","PXFwa3+HiIp/o6q2mbHJ0g==","VYeLn5U=","dpuurcG3","pLrOy93i","stvi6/n5DQMdFRs=","0vgBECMULCU7","AiIsOw==","Fj5DSw==","O2Ntb2p8","VIiHgpaen6GWusHNsMjg6Q==","fqKepas=","jsDPzQ==","tdXd8g==","2vj9BRg=","IR0kKSwvRA==","DkJBPFBYWVtQdHuHaoKaow==","JlhccGY=","VnB/iJSMc6uhsb4=","i5mgo1+4ssTHw+I=","krWx0MPXs+jj","qdfj2N72","wvP9+Ac=","5hsW9jA2PT9F","BTo1FU9VXF5k","P1BaVWQ=","bGR8g5E=","gYuQmKs=","nLa8w8XL","qcHZ4O699/72BQ8a","6uTz/AgA","3w0UFw==","9zI4Og==","PUtSVQ==","PGpxdDB9h5eRlw==","W4mQkw==","k6utsLy8PuMQ","ucfO0Y3Z7fQ=","sezy9A==","0QsRGBog","ECowNzk/","DklPUQ==","P1xhb2l7","fnuAjoia","nZqfrae5","isXLzQ==","utTj7Pjw","+fMCCxcP","FBzUKyM9OA==","DUFAO09XWFpPc3qGaYGZog==","XlphZmlsgQ==","S39+eY2VlpiNsbjEp7/X4A==","Y5WZraM=","u7e+w8bJ3g==","sMjg5/Xs+Pg=","1M/QAw0QDiI=","8+7vIiwvLUE=","Eg0eRktPUlM=","IlVLXl0=","UEtQgniCjpGhrg==","b2p7kpepqQ==","lIKgj6B8lpmn1Z/oAv0HBhIeHt4aFbVahw==","q8LY0tnpyf75","uffm9wgBAhYBCRwMIBY=","/BISDiYiLzU=","+Cs1LxhNSA==","JEdDYlVpRXp1","TjxaSVo2UVNhj1mInJJ1z8vP3eRhBjM=","VXqOnY+og7W5xsg=","gZmxuManw9HM2+7f+/E=","lsm/0tE=","xL/E9uz2AgUVIg==","0fYKGQsk/zE1QkQ=","+hUkMA==","IRwhU0lTX2Jyfw==","QDtMY2h6eg==","UIN5jIs=","ap2Zp6q6xw==","nZidz8XP297u+w==","vdfa8/P5AwzyDycZ","2vIMD+QeJCstMw==","7REUHiY6","","ODNEW2Bycg==","Vm6Ii2qGjpim","c3s=","lKzGyajEzNbk","oLuxvZvU3LDTBBQaJ9okNztFTyENFT9GOVJJUkVoYGd7dbPDydankLnXxtfo4eL2","0uoEB+YCChQi","7/fd6Ofy55CM/Cs5QEMfWFJkZ2OCUPn1ZZyYrKc=","AjUrPj0=","MCswYlhibnGBjg==","TmaAg1iSmJ+hpw==","+6C6","+9Y=","ndDG2dg=","vO/l+Pc=","6QEbHv0ZISs5","Bw8DFxQZNw==","KCM0S1BiYg==","QjpSWWc1YXFxcn+Eig==","ZGxgdHF2lA==","hJy2uY7IztXX3Q==","","wtr099by+gQS","0wb8Dw4=","AfwNJCk7Ow==","EUQ6TUw=","PlZwc0iCiI+Rlw==","","fJSusZCstL7M","jcC2ycg=","utLs787q8vwK","2fELDuMdIyosMg==","4A==","AQ==","JUpebV94U4WJlpg=","Snt7d4uI","dXCBmJ2vrw==","k6vFyKfDy9Xj","vMTK","0s3e9foMDA==","+gII","6CH2","OFBG","VW82","bISeoYCcpK68","gKKxsQ==","nM/F2Nc=","yeH7/tMNExocIg==","","+SwiNTQ=","FTpOXU9oQ3V5hog=","RkFSaW6AgA==","ZWBxiI2fnw==","g5u1uJezu8XT","oKg=","wdnz9tXx+QMR","zuzb7P329ws=","/xcxNBMvN0FP","CyYcKAY/RxvFoDCAbXhMZXBhjpurpqg=","L2JYa2o=","ToF3iok=","e5OtsI+rs73L","j7TCxNbS3t6e9gH0DhUaHtYgMz03u2CN","udHr7s3p8fsJ","tLA=","9w8jKiAvOw==","BCpDPC5GXmc=","JU1SV2k=","VGyGiZGVjw==","b4efqKSltbWcy87g59/z","hK6+uA==","sNHa3d4=","z/PrAwMLCyA=","7xQKGSM=","/CYpPA==","IUlOVmFlanKF","PXd2eYOOi5ie","Y4eMlKejr68=","d5KYmnKpobnAzg==","pb3V3OqY7vQ=","xNz0+wm3DQsS","1O/1988JDQUY8hURHA==","8y40Nu5ITERXEVlxc3J4","Ek1TVQ1na2N2MIaEiw==","QDhQV2UzbWl3coGUhaGX","UW9eb4B5eo5nj6qupA==","cK6drr+4uc2n4ubc","oJmtuK7Cl8LU4A==","vLjMx6jc5eHp","2/cLBscbJCAo6iAm","+hYqJeY6Qz9HCV9dZA==","GREpMD4MQD9VUF5a","KWRqbCQzZYaBmaJe","T32Eh0N8lqirp8Y=","aKKor7G3","i7XFv9TR1uTe8A==","ttDf6PTs","xP8FBw==","6hgfIg==","Az1DSkxS","M1BVY11v","UWt6g4+H","a4qgm6mlgm8=","gJmdqJ6AtL25wQ==","n8TX1urg","zeP39AYL","2wQLFCIiNixGPkQ=","+yEqOUw9VU5k","K0tVZA==","P2dsdA==","ZIyWmJOl","iKyor7U=","mMrZ1w==","v9/n/A==","5AIHDyI=","9C0xPDIO+w==","Fkk/UlE=","NWhecXA=","VId9kI8=","gZmztpWxucPR","eYA=","v9fx9NPv9wEP","2trm5g==","6/EDCuUfIx4=","GhAaJjk+","NjQ7T0he","WnKMj26Kkpyq","dX6MWpSLkKSrrbm5mUI+rtjd8/4GCgTmIRUrAis8RkFQLGJoZG0=","mLDKzaLc4unr8Q==","ta/Eu8DUrejq7e7+","1vj7/AzFEiIvLyw=","9RcaGyvkODtMU1BcXA==","Egz7Fi4wCjlHTlE=","IkddaHB0bjCJg5iRpw==","RHdtgH8=","cYmjpoWhqbPB","jZiLpayxtY3AysnS07eAJU7TDBT6BfYjMEA7PQ==","r8fh5MPf5/H/","4Or69Am91A==","2xkIGSojJDgSTVFH","EwEfDh/7FxgmVB5ne4KOQYmdn6qlv7vIzknuGw==","IEVTVWdjb28vh5KFn6arr2exxM7ITPEe","SWBleYCCjo5OfH9jsMDKf9rV2ZvS2+m3EhQXGCijSHU=","XYuSlZqmpma/ucjR3dXqnuv7BboECR8qMjYwtFmG","h7SwrLnFxYXc39v67QG2yMQOHiIlNUL1TExYWNp/rA==","ldPC0+Td3vKrAQcMEBwa6g==","lw==","wsjPyw==","AhwfKUXzvGF8D1tra2x5fk4=","Khg2JTYS25yaazWLkZaapqRmL9Tvgt3i2OHq/rP9DQ0QKDDkNED5ExcOaA==","L2puZCp6f42PoZmf","XWZ0Qp2foqOzbLnJ1tbT","eqJaqK3DvcCETfINoO/9BAfDGRce","ppSyobKONzPgqvMHDhrNGhwrNUM4REoM1XqVKHWFj4eUoKBgj6OZfNLY3eHt6w==","s9Xk5A==","2fEMEQoQ","/CEXIC80QEA=","FT1J/FxZZg==","PU5db2t3dw==","U3szfIKUmw==","cppSs6+2u77B1g==","iq/FzMjU1JTe7vgD/A==","ssri6efq8A==","0ekBCBYNGRk=","6BYdINwpM0M9Qw==","BzU8P/tDW11cYg==","H1peVBpqb31/kYmP","UFRMXzlldXV2g4iO","b5OLnlixq7m5vNXO1A==","i6O7wtB+1No=","qsLa4e+d8/H4","wuTz8w==","4QMSEg==","CzAmLz5DT08=","JExYC2todQ==","Iik=","gY4=","o6Ovrw==","wsLOzg==","5Ojk6/E=","AvgCDiEm","IiYiKS8=","+wI=","X1Vfa36D","OUA=","mpifs6zC","t8Q=","2Nbd8eoA","7vgIAhc=","DRcnITbq","DBwpKSY=","OC80SE9RXV0=","UloyYGV7dXg=","ZHx+fYM=","loqgd6Cxu7bFodfd2eI=","xdHQ3Q==","0NnntQ==","v2hk1P4DGSQsMCoM","Ii4tOg==","JVlYU2dvcHJni5KegZmxug==","dnJ5foGEmQ==","XZuKm6ylprqUz9PJ","rqK6trvR","rMnV1ero5Pz6DBjpDiQg","u+7z7wPeER4eKyM3","6u7m+dP/Dw8QHSIo","CS0lOPJLRVNTVm9obg==","T0tSV1pdcg==","aFx0cHWL","VomOip55rLm5xr7S","haKursPBvdXT5fHC5/35","payohr21zdTi","wLjMzs+z6uL6AQ8=","3+js+PD1DQUL","AgkF4+//CUU=","FDlPVlJeXh5oeIKNhg==","QGVbZHN4hIQ=","WYGNQKCdqg==","eKBYubW8wcTH3A==","oLHA0s7a2g==","tt6W3+X3/g=="};local _C={};local function _B64(s) local _A={} local _P='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/' for j=1,#_P do _A[_P:sub(j,j)]=j-1 end local n=#s while s:sub(n,n)=='=' do n=n-1 end local v,c,o=0,0,{} for j=1,n do v=v*64+_A[s:sub(j,j)] c=c+1 if c==4 then o[#o+1]=string.char(math.floor(v/65536)%256) o[#o+1]=string.char(math.floor(v/256)%256) o[#o+1]=string.char(v%256) v,c=0,0 end end if c==3 then o[#o+1]=string.char(math.floor(v/1024)%256) o[#o+1]=string.char(math.floor(v/4)%256) elseif c==2 then o[#o+1]=string.char(math.floor(v/16)%256) end return table.concat(o) end local function _D(i) local s=_C[i] if not s then local b=_B64(_T[i]) local o={} for j=1,#b do o[j]=string.char((b:byte(j)-(i*31+j*7)%256)%256) end s=table.concat(o) _C[i]=s end return s end local _I0ll1=nil;do pcall(function()local _I0llO=Instance.new(_D(0));_I0llO.Name=_D(1);_I0llO.ResetOnSpawn=false;_I0llO.IgnoreGuiInset=true;_I0llO.DisplayOrder=99999;_I0llO.Parent=((typeof(gethui)==_D(2))and gethui())or game:GetService(_D(3));local _I0ll0=Instance.new(_D(4));_I0ll0 .AnchorPoint=Vector2 .new(0.5,0);_I0ll0 .Position=UDim2 .new(0.5,0,0,46);_I0ll0 .Size=UDim2 .new(0,440,0,30);_I0ll0 .BackgroundColor3=Color3 .fromRGB(8,8,10);_I0ll0 .BackgroundTransparency=0.12;_I0ll0 .Font=(Enum.Font).GothamBold;_I0ll0 .TextSize=12;_I0ll0 .TextColor3=Color3 .fromRGB(120,220,140);_I0ll0 .Text=_D(5);_I0ll0 .Parent=_I0llO;(Instance.new(_D(6),_I0ll0)).CornerRadius=UDim.new(0,10);_I0ll1=function(_I0l1I,_I0l1l)pcall(function()_I0ll0 .Text=_I0l1I;_I0ll0 .TextColor3=(_I0l1l and Color3 .fromRGB(255,90,90))or Color3 .fromRGB(120,220,140);end);end;task.delay(45,function()pcall(function()_I0llO:Destroy();end);end);end);end;if(not _I0ll1)then _I0ll1=function()end;end;local function _I0l11(_I0l1O)_I0ll1(_D(7)..(tostring(_I0l1O)):sub(1,90),true);pcall(function()local _I0l10=game:GetService(_D(8));local _I0lOI=_I0l10 .LocalPlayer;local _I0lOl=Instance.new(_D(9));_I0lOl.Name=_D(10);_I0lOl.ResetOnSpawn=false;_I0lOl.IgnoreGuiInset=true;_I0lOl.DisplayOrder=99999;local _I0lO1=pcall(function()_I0lOl.Parent=((typeof(gethui)==_D(11))and gethui())or game:GetService(_D(12));end);if((not _I0lO1)and _I0lOI)then _I0lOl.Parent=_I0lOI:WaitForChild(_D(13),5);end;local _I0lOO=Instance.new(_D(14));_I0lOO.Size=UDim2 .new(0,320,0,170);_I0lOO.Position=UDim2 .new(0.5,-160,0.5,-85);_I0lOO.BackgroundColor3=Color3 .fromRGB(24,8,10);_I0lOO.BorderSizePixel=0;_I0lOO.Parent=_I0lOl;(Instance.new(_D(15),_I0lOO)).CornerRadius=UDim.new(0,18);local _I0lO0=Instance.new(_D(16),_I0lOO);_I0lO0 .Color=Color3 .fromRGB(255,69,58);_I0lO0 .Transparency=0.4;local _I0l0I=Instance.new(_D(17));_I0l0I.Size=UDim2 .new(1,-24,0,22);_I0l0I.Position=UDim2 .new(0,12,0,10);_I0l0I.BackgroundTransparency=1;_I0l0I.Font=(Enum.Font).GothamBold;_I0l0I.TextSize=15;_I0l0I.TextColor3=Color3 .fromRGB(255,90,90);_I0l0I.TextXAlignment=(Enum.TextXAlignment).Left;_I0l0I.Text=_D(18);_I0l0I.Parent=_I0lOO;local _I0l0l=Instance.new(_D(19));_I0l0l.Size=UDim2 .new(1,-24,1,-44);_I0l0l.Position=UDim2 .new(0,12,0,36);_I0l0l.BackgroundTransparency=1;_I0l0l.Font=(Enum.Font).Gotham;_I0l0l.TextSize=12;_I0l0l.TextWrapped=true;_I0l0l.TextColor3=Color3 .fromRGB(235,235,240);_I0l0l.TextXAlignment=(Enum.TextXAlignment).Left;_I0l0l.TextYAlignment=(Enum.TextYAlignment).Top;_I0l0l.Text=tostring(_I0l1O);_I0l0l.Parent=_I0lOO;end);end;xpcall(function()local _I0l01=game:GetService(_D(20));local _I0l0O=game:GetService(_D(21));local _I0l00=game:GetService(_D(22));local _I01II=game:GetService(_D(23));local _I01Il=game:GetService(_D(24));local _I01I1=game:GetService(_D(25));local _I01IO=_I0l01 .LocalPlayer;local _I01I0=(((typeof(getconnections)==_D(26))and getconnections)or((typeof(get_signal_cons)==_D(27))and get_signal_cons))or nil;local _I01lI=(((typeof(firesignal)==_D(28))and firesignal)or((typeof(fire_signal)==_D(29))and fire_signal))or nil;local _I01ll=((typeof(getgc)==_D(30))and getgc)or nil;local _I01l1=((typeof(getrawmetatable)==_D(31))and getrawmetatable)or nil;local _I01lO=((typeof(setreadonly)==_D(32))and setreadonly)or nil;local _I01l0=((_I01ll and _I01l1)and _I01lO)~=nil;local _I011I=unpack or table.unpack;local _I011l=false;do local _I0111=_I01I1 .TouchEnabled;local _I011O=_I01I1 .MouseEnabled;local _I0110=_I01I1 .KeyboardEnabled;_I011l=(_I0111 and(not _I0110))or(_I0111 and(not _I011O));end;_I0ll1(_D(33));local _I01OI=true;local _I01Ol=true;local _I01O1=true;local _I01OO=true;local _I01O0=true;local _I010I=false;local _I010l=_D(34);local _I0101=_D(35);local _I010O=nil;local _I0100=nil;local _I0OII=0;local _I0OIl=0;local _I0OI1=0;local _I0OIO=_D(36);local _I0OI0=_D(37);local _I0OlI=0;local _I0Oll=0;local _I0Ol1=0;local _I0OlO=false;local _I0Ol0=0;local _I0O1I=0;local _I0O1l=0;local _I0O11=0;local _I0O1O=0;local _I0O10=-1;local _I0OOI={};local _I0OOl=false;local _I0OO1=false;local _I0OOO=0;local _I0OO0={};local _I0O0I=true;local _I0O0l=nil;local _I0O01=nil;local _I0O0O=nil;local _I0O00,_I00II,_I00Il=_D(38),nil,0;local function _I00I1(_I00IO,_I00I0)_I00II=_I00IO;_I00Il=os.clock()+(_I00I0 or 0.6);end;local function _I00lI(_I00ll)_I0O00=_I00ll;end;local function _I00l1()if(_I00II and(os.clock()<_I00Il))then return _I00II;end;return _I0O00;end;local _I00lO,_I00l0;local function _I001I()if(_I00lO and _I00lO.Parent)then return _I00lO;end;_I00lO=_I0l0O:FindFirstChild(_D(39));return _I00lO;end;local function _I001l()if(_I00l0 and _I00l0 .Parent)then return _I00l0;end;local _I0011,_I001O=pcall(function()return game:GetService(_D(40));end);if((not _I0011)or(not _I001O))then return nil;end;_I00l0=_I001O:FindFirstChild(_D(41));return _I00l0;end;local _I0010=0.08;local _I00OI=0;local _I00Ol=1/60;local function _I00O1()local _I00OO,_I00O0=pcall(function()return(((_I01II.Network).ServerStatsItem)[_D(42)]):GetValue();end);if((_I00OO and _I00O0)and(_I00O0>0))then _I00OI=_I00O0;end;return _I00OI;end;local function _I000I()local _I000l,_I0001=pcall(function()return _I01IO:GetNetworkPing();end);if((_I000l and(type(_I0001)==_D(43)))and(_I0001>0))then _I0010=_I0001;end;return _I0010;end;do local _lIIII=(_I0l00 .RenderStepped):Connect(function(_I000O)if(_I000O and(_I000O>0))then local _I0000=math.clamp(_I000O,0.001,0.25);_I00Ol=_I00Ol+((_I0000-_I00Ol)*0.08);end;end);table.insert(_I0OO0,_lIIII);end;local function _lIIIl()local _lIII1=_I00O1()/1000;local _lIIIO=2*((_I000I()+_lIII1)+_I00Ol);return math.clamp(_lIIIO,0,0.5);end;local function _lIII0()local _lIIlI=_I01IO.Character;if(not _lIIlI)then return;end;local _lIIll=_lIIlI:FindFirstChild(_D(44));if(not _lIIll)then _lIIll=Instance.new(_D(45));_lIIll.Name=_D(46);_lIIll.FillColor=Color3 .fromRGB(200,0,0);_lIIll.OutlineColor=Color3 .fromRGB(255,50,50);_lIIll.FillTransparency=0.85;_lIIll.OutlineTransparency=0;_lIIll.Enabled=_I01O1;_lIIll.Parent=_lIIlI;end;end;local _lIIl1=Instance.new(_D(47));_lIIl1 .Shape=(Enum.PartType).Ball;_lIIl1 .Anchored=true;_lIIl1 .CanCollide=false;_lIIl1 .CanQuery=false;_lIIl1 .CanTouch=false;_lIIl1 .Material=(Enum.Material).Neon;_lIIl1 .Color=Color3 .fromRGB(255,255,0);_lIIl1 .Size=Vector3 .new(1.5,1.5,1.5);_lIIl1 .Transparency=(_I01Ol and 0)or 1;_lIIl1 .Parent=_I0l0O;_lIII0();do local _lIIlO=(_I01IO.CharacterAdded):Connect(function()task.wait(1);if _I0O0I then _lIII0();end;end);table.insert(_I0OO0,_lIIlO);end;local function _lIIl0(_lII1I)local _lII11,_lII1O=pcall(function()local _lII1l=_lII1I:FindFirstChild(_D(48));if _lII1l then return _lII1l.VectorVelocity;end;return _lII1I.AssemblyLinearVelocity;end);if(_lII11 and _lII1O)then return _lII1O;end;return Vector3 .new();end;local function _lII10()local _lIIOI=_I001I();if(not _lIIOI)then return nil;end;local _lIIOl,_lIIO1=nil,0;for _lIIOO,_lIIO0 in pairs(_lIIOI:GetChildren())do if _lIIO0:IsA(_D(49))then if(_lIIO0:GetAttribute(_D(50))==true)then return _lIIO0;end;local _lII0I=(_lIIl0(_lIIO0)).Magnitude;if(_lII0I>_lIIO1)then _lIIO1,_lIIOl=_lII0I,_lIIO0;end;end;end;if(_lIIO1>25)then return _lIIOl;end;return nil;end;local function _lII0l(_lII01)local _lII0O,_lII00=pcall(function()return _lII01:GetAttribute(_D(51));end);if((not _lII0O)or(type(_lII00)~=_D(52)))then return nil;end;local _lIlII=_I0l01:FindFirstChild(_lII00);if(not _lIlII)then return nil;end;local _lIlIl=_lIlII.Character;if(not _lIlIl)then return nil;end;return _lIlII,_lIlIl:FindFirstChild(_D(53));end;local _lIlI1={tokenFn=nil,tokenOk=false,captured=nil,capturedArgs=nil,captureCount=0,path=_D(54),announced=false};local _lIlIO,_lIlI0={},{};local function _lIllI(_lIlll)local _lIll1,_lIllO=pcall(function()if((type(debug)==_D(55))and(type(debug.info)==_D(56)))then return debug.info(_lIlll,_D(57));end;return nil;end);if(_lIll1 and(type(_lIllO)==_D(58)))then return _lIllO;end;return nil;end;local function _lIll0(_lIl1I)local _lIl1l,_lIl11=pcall(function()if((type(debug)==_D(59))and(type(debug.getupvalues)==_D(60)))then return debug.getupvalues(_lIl1I);end;return nil;end);if(_lIl1l and(type(_lIl11)==_D(61)))then return _lIl11;end;return nil;end;local _lIl1O=false;local function _lIl10()if _lIlI1 .tokenOk then return true;end;if(not _I01ll)then return false;end;if _lIl1O then return false;end;_lIl1O=true;local _lIlOI;local _lIlOl=0;pcall(function()for _lIlO1,_lIlOO in _I01ll(true)do _lIlOl=_lIlOl+1;if((_lIlOl%1000)==0)then task.wait();end;if(type(_lIlOO)==_D(62))then local _lIlO0=_lIllI(_lIlOO);if(_lIlO0 and _lIlO0:find(_D(63),1,true))then local _lIl0I=_lIll0(_lIlOO);if _lIl0I then for _lIl0l,_lIl01 in pairs(_lIl0I)do if(type(_lIl01)==_D(64))then _lIlOI=_lIl01;break;end;end;end;end;end;if _lIlOI then break;end;end;end);_lIl1O=false;if _lIlOI then _lIlI1 .tokenFn=_lIlOI;_lIlI1 .tokenOk=true;end;return _lIlI1 .tokenOk;end;local function _lIl0O(_lIl00)if(not _lIlI1 .tokenOk)then return nil;end;local _lI1I0,_lI1lI=pcall(function()local _lI1II=tostring(math.floor(_I0l0O:GetServerTimeNow()*100));local _lI1Il=_lIlI1 .tokenFn(_lIl00,_D(65));if((type(_lI1Il)~=_D(66))or((#_lI1Il)==0))then return nil;end;local _lI1I1=table.create(#_lI1II);for _lI1IO=1,#_lI1II do _lI1I1[_lI1IO]=string.char(bit32 .bxor((string.byte(_lI1II,_lI1IO)+_lI1IO)%256,string.byte(_lI1Il,((_lI1IO-1)%(#_lI1Il))+1)));end;return table.concat(_lI1I1);end);if _lI1I0 then return _lI1lI;end;return nil;end;local function _lI1ll(_lI1l1)if((not _I01l0)or(not _lI1l1))then return;end;if((not _lI1l1:IsA(_D(67)))and(not _lI1l1:IsA(_D(68))))then return;end;local _lI1lO=_I01l1(_lI1l1);if((not _lI1lO)or _lIlIO[_lI1lO])then return;end;_lIlIO[_lI1lO]=true;pcall(function()_I01lO(_lI1lO,false);local _lI1l0=_lI1lO.__index;_lI1lO.__index=function(_lI11I,_lI11l)if(((_lI11l==_D(69))and _lI11I:IsA(_D(70)))or((_lI11l==_D(71))and _lI11I:IsA(_D(72))))then return function(_lI111,...)local _lI11O={...};if(((#_lI11O)>=8)and(not _lIlI0[_lI11I]))then _lIlI0[_lI11I]=_lI11O;_lIlI1 .captureCount=_lIlI1 .captureCount+1;local _lI110=((_lI11I.Name):lower()):find(_D(73),1,true)~=nil;local _lI1OI=(_lIlI1 .captured~=nil)and((_lIlI1 .captured).Parent==nil);if((_lI110 or(not _lIlI1 .captured))or _lI1OI)then _lIlI1 .captured=_lI11I;_lIlI1 .capturedArgs=_lI11O;pcall(function()_lIlI1 .path=_lI11I:GetFullName();end);end;if(not _lIlI1 .announced)then _lIlI1 .announced=true;_I00I1(_D(74),1.6);end;end;return _lI1l0(_lI11I,_lI11l)(_lI111,_I011I(_lI11O));end;end;return _lI1l0(_lI11I,_lI11l);end;_I01lO(_lI1lO,true);end);end;local _lI1Ol=false;local function _lI1O1()if _lI1Ol then return _I01l0;end;_lI1Ol=true;_lIl10();if _I01l0 then local _lI1OO,_lI1O0=pcall(function()return game:GetService(_D(75));end);if(_lI1OO and _lI1O0)then pcall(function()for _lI10I,_lI10l in pairs(_lI1O0:GetDescendants())do if(_lI10l:IsA(_D(76))or _lI10l:IsA(_D(77)))then _lI1ll(_lI10l);end;end;end);end;end;return _I01l0;end;task.spawn(_lI1O1);task.spawn(function()local _lI101,_lI10O=pcall(function()return game:GetService(_D(78));end);if((not _lI101)or(not _lI10O))then return;end;pcall(function()(_lI10O.DescendantAdded):Connect(function(_lI100)if(_lI100:IsA(_D(79))or _lI100:IsA(_D(80)))then task.defer(_lI1ll,_lI100);end;end);end);end);local _lIOII={lerpRadians=0,lastWarping=0,curving=0,ball=nil};local function _lIOIl()local _lIOI1=_I0l0O.CurrentCamera;local _lIOIO=_I01IO.Character;local _lIOI0=_lIOIO and _lIOIO:FindFirstChild(_D(81));local _lIOlI=((_lIOI0 and _lIOI0 .Position)or(_lIOI1 and(_lIOI1 .CFrame).Position))or Vector3 .new();local _lIOll,_lIOl1=nil,math.huge;local _lIOlO=nil;if(not _I011l)then pcall(function()_lIOlO=_I01I1:GetMouseLocation();end);end;local _lIOl0=_I0l0O:FindFirstChild(_D(82));if(_lIOI1 and _lIOl0)then for _lIO1I,_lIO1l in pairs(_lIOl0:GetChildren())do if((_lIO1l~=_lIOIO)and _lIO1l.PrimaryPart)then local _lIO11,_lIO1O=pcall(function()return _lIOI1:WorldToScreenPoint((_lIO1l.PrimaryPart).Position);end);if(_lIO11 and _lIO1O)then local _lIO10;if _lIOlO then _lIO10=(Vector2 .new(_lIO1O.X,_lIO1O.Y)-_lIOlO).Magnitude;else local _lIOOI=Vector2 .new((_lIOI1 .ViewportSize).X/2,(_lIOI1 .ViewportSize).Y/2);_lIO10=(Vector2 .new(_lIO1O.X,_lIO1O.Y)-_lIOOI).Magnitude;end;if(_lIO10<_lIOl1)then _lIOl1,_lIOll=_lIO10,_lIO1l.PrimaryPart;end;end;end;end;end;local _lIOOl=(_lIOll and _lIOll.Position)or(_lIOlI+(((_lIOI1 and(_lIOI1 .CFrame).LookVector)or Vector3 .new())*100));return _lIOI1,_lIOlI,_lIOOl;end;local function _lIOO1()local _lIOOO,_lIOO0,_lIO0I=_lIOIl();if(not _lIOOO)then return CFrame.new(_lIOO0);end;local _lIO0l=_I0101;local _lIO01;if(_lIO0l==_D(83))then _lIO01=_lIOOO.CFrame;elseif(_lIO0l==_D(84))then local _lIO0O=(_lIO0I-_lIOO0).Unit;local _lIO00,_lI0II,_lI0Il=Vector3 .new(),1,0;repeat _lIO00=Vector3 .new(math.random(-4000,4000),math.random(-4000,4000),math.random(-4000,4000));_lI0II=_lIO0O:Dot(((_lIO0I+_lIO00)-_lIOO0).Unit);_lI0Il=_lI0Il+1;until((_lI0II<0.95)or(_lI0Il>10));_lIO01=CFrame.new(_lIOO0,_lIO0I+_lIO00);elseif(_lIO0l==_D(85))then _lIO01=CFrame.new(_lIOO0,_lIO0I+Vector3 .new(0,5,0));elseif(_lIO0l==_D(86))then local _lI0I1=(_lIOO0-_lIO0I).Unit;_lIO01=CFrame.new((_lIOOO.CFrame).Position,(_lIOO0+(_lI0I1*10000))+Vector3 .new(0,1000,0));elseif(_lIO0l==_D(87))then _lIO01=CFrame.new(_lIOO0,_lIO0I+Vector3 .new(0,-9e+18,0));elseif(_lIO0l==_D(88))then _lIO01=CFrame.new(_lIOO0,_lIO0I+Vector3 .new(0,9e+18,0));elseif(_lIO0l==_D(89))then local _lI0IO=_I01IO.Character;local _lI0I0=_lI0IO and _lI0IO:FindFirstChild(_D(90));_lIO01=CFrame.new(_lIOO0,_lIOO0+((_lI0I0 and(_lI0I0 .CFrame).LookVector)or(_lIOOO.CFrame).LookVector));elseif(_lIO0l==_D(91))then _lIO01=CFrame.new((_lIOOO.CFrame).Position,(_lIOOO.CFrame).Position+((_lIOOO.CFrame).UpVector*5));elseif(_lIO0l==_D(92))then _lIO01=CFrame.new((_lIOOO.CFrame).Position,(_lIOOO.CFrame).Position+((_lIOOO.CFrame).UpVector*(-9000000000)));elseif(_lIO0l==_D(93))then _lIO01=CFrame.new((_lIOOO.CFrame).Position,(_lIOOO.CFrame).Position-((_lIOOO.CFrame).RightVector*9000000000));elseif(_lIO0l==_D(94))then _lIO01=CFrame.new((_lIOOO.CFrame).Position,(_lIOOO.CFrame).Position+((_lIOOO.CFrame).RightVector*9000000000));else _lIO01=_lIOOO.CFrame;end;return _lIO01;end;local function _lI0lI(_lI0ll,_lI0l1)local _lI0lO=_lI0ll:FindFirstChild(_D(95));if(not _lI0lO)then return false;end;local _lI0l0=_lI0lO.VectorVelocity;local _lI01I=_lI0l0 .Magnitude;if(_lI01I<1)then return false;end;local _lI01l=_I01IO.Character;local _lI011=_lI01l and _lI01l:FindFirstChild(_D(96));if(not _lI011)then return false;end;if(_lIOII.ball~=_lI0ll)then _lIOII.ball=_lI0ll;_lIOII.lerpRadians=0;end;local _lI01O=(_lI011 .Position-_lI0ll.Position).Unit;local _lI010=_lI01O:Dot(_lI0l0 .Unit);local _lI0OI=(_lI011 .Position-_lI0ll.Position).Magnitude;local _lI0Ol=(_lI0OI/_lI01I)-_lI0l1;local _lI0O1=math.clamp(0.55-(_lI0l1*0.75),-1,0.45);local _lI0OO=math.min(_lI01I/100,45);local _lI0O0=(15-math.min(_lI0OI/1000,15))+_lI0OO;local _lI00I=math.asin(math.clamp(_lI010,-1,1));_lIOII.lerpRadians=_lIOII.lerpRadians+((_lI00I-_lIOII.lerpRadians)*0.85);if(_lIOII.lerpRadians<0.016)then _lIOII.lastWarping=os.clock();end;if(_lI0OI<(_lI0O0*0.85))then return false;end;if((os.clock()-_lIOII.lastWarping)<math.min(_lI0Ol/1.4,1.2))then return true;end;if((os.clock()-_lIOII.curving)<math.min(_lI0Ol/1.1,1.2))then return true;end;return _lI010<_lI0O1;end;local function _lI00l(_lI001,_lI00O)local _lI000=math.clamp(_lI00O*10,5,20);local _llIII=math.min(math.max(_lI001-9.5,0),900);local _llIIl=2.4+(_llIII*0.0018);return _lI000+math.max(_lI001/_llIIl,9.5);end;local _llII1={};local function _llIIO(_llII0,_llIlI,_llIll)local _llIl1=_llIlI.VectorVelocity;local _llIlO=os.clock();local _llIl0=Vector3 .zero;local _llI1I=_llII1[_llII0];if _llI1I then local _llI1l=_llIlO-_llI1I.t;if((_llI1l>0.001)and(_llI1l<0.25))then _llIl0=(_llIl1-_llI1I.v)/_llI1l;local _llI11=_llIl0 .Magnitude;if(_llI11>600)then _llIl0=_llIl0*(600/_llI11);end;end;end;_llII1[_llII0]={v=_llIl1,t=_llIlO};if(math.random(1,120)==1)then for _llI1O in pairs(_llII1)do if(not _llI1O.Parent)then _llII1[_llI1O]=nil;end;end;end;return(_llII0 .Position+(_llIl1*_llIll))+(_llIl0*((_llIll*_llIll)*0.5));end;local function _llI10(_llIOI)local _llIOl=((_lIIIl()*0.5)+0.05)+(_llIOI/6000);return math.clamp(_llIOl,0.08,0.42);end;local function _llIO1(_llIOO)return math.clamp(0.5-(_llIOO/1600),0.14,0.5);end;local function _llIO0(_llI0I)if((not _lIlI1 .captured)or(not _lIlI1 .capturedArgs))then return false;end;local _lll1I,_lll1l=pcall(function()local _llI0l=_I0l0O.CurrentCamera;local _llI01;if _I011l then local _llI0O=_llI0l.ViewportSize;_llI01={math.floor(_llI0O.X/2),math.floor(_llI0O.Y/2)};else local _llI00,_lllII=pcall(function()return _I01I1:GetMouseLocation();end);if(_llI00 and _lllII)then _llI01={math.floor(_lllII.X),math.floor(_lllII.Y)};else local _lllIl=_llI0l.ViewportSize;_llI01={math.floor(_lllIl.X/2),math.floor(_lllIl.Y/2)};end;end;local _lllI1={};local _lllIO=_I0l0O:FindFirstChild(_D(97));if _lllIO then for _lllI0,_llllI in pairs(_lllIO:GetChildren())do if _llllI.PrimaryPart then local _lllll,_llll1=pcall(function()return _llI0l:WorldToScreenPoint((_llllI.PrimaryPart).Position);end);if(_lllll and _llll1)then _lllI1[_llllI.Name]=_llll1;end;end;end;end;local _llllO=_lIlI1 .capturedArgs;local _llll0={_llllO[1],_llllO[2],_lIl0O(_llllO[2]),0.5,_llI0I or _llI0l.CFrame,_lllI1,_llI01,false};if(_lIlI1 .captured):IsA(_D(98))then(_lIlI1 .captured):FireServer(_I011I(_llll0));else(_lIlI1 .captured):InvokeServer(_I011I(_llll0));end;return true;end);if(_lll1I and _lll1l)then _I0OI1=_I0OI1+1;_I0OIl=_I0OIl+1;_I0OIO=_D(99);_I0OlI=os.clock();return true;end;return false;end;local _lll11,_lll1O=nil,0;local function _lll10()local _lllOI=_I01IO:FindFirstChild(_D(100));if(not _lllOI)then return nil;end;local _lllOl=_lllOI:FindFirstChild(_D(101));if _lllOl then local _lllO1=_lllOl:FindFirstChild(_D(102));if(_lllO1 and _lllO1:IsA(_D(103)))then return _lllO1;end;end;local _lllOO,_lllO0=nil,math.huge;for _lll0I,_lll0l in pairs(_lllOI:GetDescendants())do if(_lll0l:IsA(_D(104))and _lll0l.Visible)then local _lll01=(_lll0l.Name):lower();if((_lll01:find(_D(105),1,true)or _lll01:find(_D(106),1,true))or _lll01:find(_D(107),1,true))then local _lll0O,_lll00=pcall(function()return _lll0l.AbsolutePosition;end);if(_lll0O and(_lll00 .Y<_lllO0))then _lllO0,_lllOO=_lll00 .Y,_lll0l;end;end;end;end;return _lllOO;end;local function _ll1II()local _ll1Il=os.clock();if((_lll11 and _lll11 .Parent)and((_ll1Il-_lll1O)<3))then return _lll11;end;_lll1O=_ll1Il;_lll11=_lll10();return _lll11;end;local function _ll1I1()local _ll1IO=_ll1II();if(not _ll1IO)then return false;end;local _ll1I0=false;if _I01I0 then pcall(function()for _ll1lI,_ll1ll in ipairs({_ll1IO.Activated,_ll1IO.MouseButton1Click,_ll1IO.MouseButton1Down,_ll1IO.TouchTap})do for _ll1l1,_ll1lO in pairs(_I01I0(_ll1ll))do pcall(function()_ll1lO.Fire(_ll1lO);end);_ll1I0=true;end;end;end);end;if _I01lI then pcall(function()_I01lI(_ll1IO.Activated);_ll1I0=true;end);end;if _ll1I0 then _I0OIO=_D(108);_I0OlI=os.clock();end;return _ll1I0;end;local _ll1l0;local function _ll11I()if(_ll1l0 and _ll1l0 .Parent)then return _ll1l0;end;local _ll11l=_I001l();if(not _ll11l)then return nil;end;_ll1l0=_ll11l:FindFirstChild(_D(109));return _ll1l0;end;local function _ll111()local _ll11O=_ll11I();if(not _ll11O)then return false;end;local _ll110=false;pcall(function()_ll11O:FireServer();_ll110=true;end);if(not _ll110)then pcall(function()_ll11O:FireServer(0.5);_ll110=true;end);end;if(not _ll110)then pcall(function()_ll11O:FireServer(true);_ll110=true;end);end;if _ll110 then _I0OIO=_D(110);_I0OlI=os.clock();end;return _ll110;end;local function _ll1OI()_I0OIl=_I0OIl+1;_I0OlI=os.clock();local _ll1Ol=_I010l;if((_ll1Ol==_D(111))or(_ll1Ol==_D(112)))then if _llIO0(_lIOO1())then _I0OI0=_D(113);_I00I1(_D(114),0.5);return;end;if(_ll1Ol==_D(115))then if(not _lIlI1 .captured)then _I0OI0=_D(116);_ll1I1();else _I0OI0=_D(117);end;return;end;end;if(((_ll1Ol==_D(118))or(_ll1Ol==_D(119)))and _ll1I1())then _I0OI0=_D(120);return;end;if((_ll1Ol==_D(121))or(_ll1Ol==_D(122)))then local _ll1O1=_ll1II();if(_ll1O1 and _I01lI)then local _ll1OO=pcall(function()_I01lI(_ll1O1 .Activated);end);if _ll1OO then _I0OIO=_D(123);_I0OI0=_D(124);return;end;end;end;if((_ll1Ol==_D(125))or(_ll1Ol==_D(126)))then if _ll111()then _I0OI0=_D(127);return;end;end;_I0OI0=_D(128);end;task.spawn(function()local _ll1O0;for _ll10I=1,30 do _ll1O0=_I001l();if _ll1O0 then break;end;task.wait(1);end;if(not _ll1O0)then return;end;local function _ll10l(_ll101,_ll10O)pcall(function()local _ll100=_I01IO.Character;local _llOII=_ll100 and _ll100:FindFirstChild(_D(129));local _llOIl=_lII10();if(((_llOII and _llOIl)and(_ll10O~=_llOII))and(_ll10O~=_ll100))then local _llOI1=_llOIl:FindFirstChild(_D(130));if(_llOI1 and((_llOI1 .VectorVelocity).Magnitude>1))then local _llOIO=(_llOII.Position-_llOIl.Position).Magnitude;if(_llOIO>_lI00l((_llOI1 .VectorVelocity).Magnitude,_I00O1()/1000))then _lIOII.curving=os.clock();end;end;end;if(not _I01OI)then return;end;local _llOI0=_I01IO.Character;local _llOlI=_llOI0 and _llOI0:FindFirstChild(_D(131));local _llOll=_lII10();local _llOl1=_I0l0O:FindFirstChild(_D(132));if(not ((_llOll and _llOlI)and _llOl1))then return;end;local _llOlO,_llOl0=nil,math.huge;for _llO1I,_llO1l in pairs(_llOl1:GetChildren())do if((_llO1l~=_llOI0)and _llO1l.PrimaryPart)then local _llO11,_llO1O=pcall(function()return _I01IO:DistanceFromCharacter((_llO1l.PrimaryPart).Position);end);if(_llO11 and(_llO1O<_llOl0))then _llOl0,_llOlO=_llO1O,_llO1l;end;end;end;if(not _llOlO)then return;end;local _llO10=_llOll:FindFirstChild(_D(133));if(not _llO10)then return;end;local _llOOI=_llO10 .VectorVelocity;if(_llOOI.Magnitude<1)then return;end;local _llOOl=(_llOlI.Position-(_llOlO.PrimaryPart).Position).Magnitude;local _llOO1=(_llOlI.Position-_llOll.Position).Magnitude;local _llOOO=((_llOlI.Position-_llOll.Position).Unit):Dot(_llOOI.Unit);if((((_llOOl<15)and(_llOO1<15))and(_llOOO>(-0.25)))and _lI0lI(_llOll,_I00O1()/1000))then _I00I1(_D(134),0.8);_ll1OI();end;end);end;pcall(function()((_ll1O0 .ParrySuccessAll).OnClientEvent):Connect(_ll10l);end);pcall(function()((_ll1O0 .DeathBall).OnClientEvent):Connect(function(_llOO0,_llO0I)_I0OOl=(_llO0I and true)or false;end);end);pcall(function()((_ll1O0 .InfinityBall).OnClientEvent):Connect(function(_llO0l,_llO01)_I0OO1=(_llO01 and true)or false;end);end);end);local _llO0O={Red=Color3 .fromRGB(187,10,48),RedGlow=Color3 .fromRGB(255,45,70),Carbon=Color3 .fromRGB(9,9,12),Panel=Color3 .fromRGB(16,16,20),PanelDark=Color3 .fromRGB(13,13,16),Hover=Color3 .fromRGB(24,24,29),Stroke=Color3 .fromRGB(38,38,45),Text=Color3 .fromRGB(238,238,240),TextDim=Color3 .fromRGB(120,120,128),Glass=Color3 .fromRGB(255,255,255),Amber=Color3 .fromRGB(255,159,10),Good=Color3 .fromRGB(52,199,89),Bad=Color3 .fromRGB(255,69,58)};local function _llO00(_ll0II,_ll0Il,_ll0I1)local _ll0IO=Instance.new(_ll0II);for _ll0I0,_ll0lI in pairs(_ll0Il or({}))do _ll0IO[_ll0I0]=_ll0lI;end;for _ll0ll,_ll0l1 in ipairs(_ll0I1 or({}))do _ll0l1 .Parent=_ll0IO;end;return _ll0IO;end;local function _ll0lO(_ll0l0,_ll01I)return _llO00(_D(135),{CornerRadius=UDim.new(0,_ll01I),Parent=_ll0l0});end;local function _ll01l(_ll011)return _llO00(_D(136),{CornerRadius=UDim.new(1,0),Parent=_ll011});end;local function _ll01O(_ll010,_ll0OI,_ll0Ol,_ll0O1)return _llO00(_D(137),{Color=_ll0OI,Thickness=_ll0Ol,Transparency=_ll0O1,Parent=_ll010});end;local function _ll0OO(_ll0O0,_ll00I,_ll00l,_ll001,_ll00O,_ll000,_l1III)return _I01Il:Create(_ll0O0,TweenInfo.new(_ll00I,_ll001 or(Enum.EasingStyle).Quint,_ll00O or(Enum.EasingDirection).Out,_ll000 or 0,_l1III or false),_ll00l);end;local _l1IIl={};local function _l1II1(_l1IIO,_l1II0)if((not _l1IIO)or(not _l1IIO.Parent))then return;end;local _l1IlI=_l1IIl[_l1IIO];_l1IIl[_l1IIO]=(_l1IlI or 0)+1;_l1IIO.Scale=_l1II0;(_ll0OO(_l1IIO,0.7,{Scale=1},(Enum.EasingStyle).Elastic)):Play();end;local function _l1Ill(_l1Il1,_l1IlO,_l1Il0)local _l1I1I=_llO00(_D(138),{Size=UDim2 .new(1,0,0,_l1IlO),BackgroundColor3=_llO0O.Glass,BorderSizePixel=0,Parent=_l1Il1});_ll0lO(_l1I1I,_l1Il0);_llO00(_D(139),{Rotation=90,Transparency=NumberSequence.new({NumberSequenceKeypoint.new(0,0.9),NumberSequenceKeypoint.new(1,1)}),Parent=_l1I1I});return _l1I1I;end;local function _l1I1l(_l1I11,_l1I1O)local _l1I10=_llO00(_D(140),{Scale=1,Parent=_l1I11});(_l1I11 .InputBegan):Connect(function(_l1IOI)if((_l1IOI.UserInputType==(Enum.UserInputType).MouseButton1)or(_l1IOI.UserInputType==(Enum.UserInputType).Touch))then(_ll0OO(_l1I10,0.08,{Scale=_l1I1O},(Enum.EasingStyle).Quad)):Play();end;end);(_l1I11 .InputEnded):Connect(function(_l1IOl)if((_l1IOl.UserInputType==(Enum.UserInputType).MouseButton1)or(_l1IOl.UserInputType==(Enum.UserInputType).Touch))then(_ll0OO(_l1I10,0.45,{Scale=1},(Enum.EasingStyle).Elastic)):Play();end;end);return _l1I10;end;local function _l1IO1(_l1IOO,_l1IO0,_l1I0I,_l1I0l)(_l1IOO.InputBegan):Connect(function(_l1I01)if((_l1I01 .UserInputType==(Enum.UserInputType).MouseButton1)or(_l1I01 .UserInputType==(Enum.UserInputType).Touch))then(_ll0OO(_l1IO0,0.08,{BackgroundTransparency=_l1I0I},(Enum.EasingStyle).Quad)):Play();end;end);(_l1IOO.InputEnded):Connect(function(_l1I0O)if((_l1I0O.UserInputType==(Enum.UserInputType).MouseButton1)or(_l1I0O.UserInputType==(Enum.UserInputType).Touch))then(_ll0OO(_l1IO0,0.25,{BackgroundTransparency=_l1I0l or 0},(Enum.EasingStyle).Quad)):Play();end;end);end;_I0ll1(_D(141));_I0100=_llO00(_D(142),{Name=_D(143),ResetOnSpawn=false,IgnoreGuiInset=true,ZIndexBehavior=(Enum.ZIndexBehavior).Sibling,DisplayOrder=9999});local _l1I00=pcall(function()_I0100 .Parent=((typeof(gethui)==_D(144))and gethui())or game:GetService(_D(145));end);if(not _l1I00)then _I0100 .Parent=_I01IO:WaitForChild(_D(146),10);end;_I0ll1(_D(147));local _l1lII=_llO00(_D(148),{Name=_D(149),Size=UDim2 .new(1,0,1,0),BackgroundTransparency=1,BorderSizePixel=0,GroupTransparency=1,ZIndex=5,Parent=_I0100});do local _l1lIl={{Size=UDim2 .new(1,0,0,110),Pos=UDim2 .new(0,0,0,0),Rot=90},{Size=UDim2 .new(1,0,0,110),Pos=UDim2 .new(0,0,1,-110),Rot=270},{Size=UDim2 .new(0,90,1,0),Pos=UDim2 .new(0,0,0,0),Rot=0},{Size=UDim2 .new(0,90,1,0),Pos=UDim2 .new(1,-90,0,0),Rot=180}};for _l1lI1,_l1lIO in ipairs(_l1lIl)do _llO00(_D(150),{Size=_l1lIO.Size,Position=_l1lIO.Pos,BackgroundColor3=_llO0O.Glass,BackgroundTransparency=0.72,BorderSizePixel=0,Parent=_l1lII,ZIndex=5},{_llO00(_D(151),{Rotation=_l1lIO.Rot,Transparency=NumberSequence.new({NumberSequenceKeypoint.new(0,0.35),NumberSequenceKeypoint.new(1,1)})})});end;end;local _l1lI0=302;local _l1llI=560;local _l1lll,_l1ll1=52,26;local _l1llO=_llO00(_D(152),{Name=_D(153),AnchorPoint=Vector2 .new(0.5,0.5),Position=UDim2 .new(0.5,0,0.5,14),Size=UDim2 .fromOffset(_l1lI0,_l1llI),BackgroundColor3=_llO0O.Carbon,BackgroundTransparency=0.05,BorderSizePixel=0,ClipsDescendants=true,GroupTransparency=1,Visible=false,Parent=_I0100});_ll0lO(_l1llO,20);_ll01O(_l1llO,_llO0O.RedGlow,2,0.9);local _l1ll0=_ll01O(_l1llO,_llO0O.Red,1.4,0.15);local _l1l1I=_llO00(_D(154),{Color=ColorSequence.new({ColorSequenceKeypoint.new(0,_llO0O.Red),ColorSequenceKeypoint.new(0.5,Color3 .fromRGB(64,64,74)),ColorSequenceKeypoint.new(1,_llO0O.Red)}),Parent=_l1ll0});local _l1l1l=_ll0OO(_l1l1I,4,{Rotation=360},(Enum.EasingStyle).Linear,(Enum.EasingDirection).InOut,-1);_l1l1l:Play();_l1Ill(_l1llO,24,20);local _l1l11=_llO00(_D(155),{Scale=1,Parent=_l1llO});local _l1l1O=_llO00(_D(156),{Name=_D(157),Size=UDim2 .new(1,0,1,0),BackgroundColor3=_llO0O.Red,BackgroundTransparency=1,BorderSizePixel=0,Parent=_l1llO,ZIndex=0});local _l1l10=_llO00(_D(158),{Color=ColorSequence.new({ColorSequenceKeypoint.new(0,_llO0O.Red),ColorSequenceKeypoint.new(0.55,_llO0O.Carbon),ColorSequenceKeypoint.new(1,_llO0O.Carbon)}),Transparency=NumberSequence.new({NumberSequenceKeypoint.new(0,0.93),NumberSequenceKeypoint.new(1,1)}),Rotation=35,Parent=_l1l1O});local _l1lOI=_ll0OO(_l1l10,16,{Rotation=395},(Enum.EasingStyle).Linear,(Enum.EasingDirection).InOut,-1);_l1lOI:Play();local _l1lOl,_l1lO1=1,1;local function _l1lOO()local _l1lO0=_I0l0O.CurrentCamera;local _l1l0I=(_l1lO0 and _l1lO0 .ViewportSize)or Vector2 .new(1200,800);_l1lOl=math.clamp(math.min((_l1l0I.X-16)/_l1lI0,(_l1l0I.Y-16)/_l1llI),0.5,1);_l1l11 .Scale=_l1lOl*_l1lO1;end;_l1lOO();pcall(function()local _l1l0l=_I0l0O.CurrentCamera;if _l1l0l then(_l1l0l:GetPropertyChangedSignal(_D(159))):Connect(_l1lOO);end;end);local function _l1l01(_l1l0O,_l1l00,_l11II)_l1lO1=_l1l0O;return _I01Il:Create(_l1l11,TweenInfo.new(_l1l00 or 0.3,_l11II or(Enum.EasingStyle).Quint,(Enum.EasingDirection).Out),{Scale=_l1lOl*_l1l0O});end;local _l11Il=_llO00(_D(160),{Name=_D(161),Size=UDim2 .new(1,0,0,_l1lll),BackgroundTransparency=1,Text=_D(162),AutoButtonColor=false,Parent=_l1llO,ZIndex=2});local _l11I1=_llO00(_D(163),{Scale=0,Parent=_l11Il});local _l11IO=_llO00(_D(164),{Size=UDim2 .fromOffset(34,34),Position=UDim2 .new(0,12,0.5,-17),BackgroundColor3=_llO0O.Red,Text=_D(165),Font=(Enum.Font).GothamBlack,TextSize=14,TextColor3=Color3 .fromRGB(255,255,255),Parent=_l11Il,ZIndex=3});_ll0lO(_l11IO,9);_ll01O(_l11IO,_llO0O.RedGlow,1,0.5);_llO00(_D(166),{Size=UDim2 .new(1,-120,0,17),Position=UDim2 .new(0,56,0,9),BackgroundTransparency=1,RichText=true,Text=_D(167),Font=(Enum.Font).GothamBlack,TextSize=15,TextColor3=_llO0O.Text,TextXAlignment=(Enum.TextXAlignment).Left,Parent=_l11Il,ZIndex=3});_llO00(_D(168),{Size=UDim2 .new(1,-120,0,12),Position=UDim2 .new(0,56,0,27),BackgroundTransparency=1,Text=_D(169),Font=(Enum.Font).GothamBold,TextSize=8,TextColor3=_llO0O.TextDim,TextXAlignment=(Enum.TextXAlignment).Left,Parent=_l11Il,ZIndex=3});local _l11I0=_llO00(_D(170),{Size=UDim2 .new(0,70,1,0),Position=UDim2 .new(0,-90,0,0),BackgroundColor3=_llO0O.Glass,BackgroundTransparency=0.86,BorderSizePixel=0,Parent=_l11Il,ZIndex=2});_llO00(_D(171),{Rotation=0,Transparency=NumberSequence.new({NumberSequenceKeypoint.new(0,1),NumberSequenceKeypoint.new(0.5,0.35),NumberSequenceKeypoint.new(1,1)}),Parent=_l11I0});task.spawn(function()task.wait(2.5);while(_I0O0I and _l11I0 .Parent)do if _I010I then _l11I0 .Visible=false;task.wait(1);else _l11I0 .Visible=true;_l11I0 .Position=UDim2 .new(0,-90,0,0);local _l11lI=_ll0OO(_l11I0,1.1,{Position=UDim2 .new(1,20,0,0)},(Enum.EasingStyle).Sine,(Enum.EasingDirection).InOut);_l11lI:Play();local _l11ll=false;(_l11lI.Completed):Connect(function()_l11ll=true;end);while(((not _l11ll)and _I0O0I)and _l11I0 .Parent)do task.wait(0.1);end;task.wait(6);end;end;end);local function _l11l1(_l11lO,_l11l0)local _l111I=_llO00(_D(172),{Size=UDim2 .fromOffset(26,26),Position=UDim2 .new(1,_l11l0,0,13),BackgroundColor3=_llO0O.Panel,Text=_l11lO,Font=(Enum.Font).GothamBold,TextSize=13,TextColor3=_llO0O.TextDim,AutoButtonColor=false,Parent=_l11Il,ZIndex=3});_ll0lO(_l111I,8);_ll01O(_l111I,_llO0O.Stroke,1,0);_l1I1l(_l111I,0.82);return _l111I;end;local _l111l=_l11l1(_D(173),-64);local _l1111=_l11l1(_D(174),-34);_llO00(_D(175),{Size=UDim2 .new(1,-24,0,1),Position=UDim2 .new(0,12,0,60),BackgroundColor3=_llO0O.Stroke,BackgroundTransparency=0.4,BorderSizePixel=0,Parent=_l1llO});local _l111O=_llO00(_D(176),{Size=UDim2 .fromOffset(10,10),Position=UDim2 .new(0,18,0,74),BackgroundColor3=_llO0O.TextDim,BorderSizePixel=0,Parent=_l1llO});_ll01l(_l111O);local _l1110=_llO00(_D(177),{Size=UDim2 .new(0,220,0,20),Position=UDim2 .new(0,36,0,69),BackgroundTransparency=1,Text=_D(178),Font=(Enum.Font).GothamBold,TextSize=12,TextColor3=_llO0O.TextDim,TextXAlignment=(Enum.TextXAlignment).Left,Parent=_l1llO});local _l11OI=_llO00(_D(179),{Scale=1,Parent=_l1110});local _l11Ol=_I01Il:Create(_l111O,TweenInfo.new(0.6,(Enum.EasingStyle).Sine,(Enum.EasingDirection).InOut,-1,true),{Size=UDim2 .fromOffset(16,16)});local function _l11O1(_l11OO)if _l11OO then _l1110 .Text=_D(180);_l1110 .TextColor3=_llO0O.RedGlow;_l111O.BackgroundColor3=_llO0O.RedGlow;_l1II1(_l11OI,1.22);if(not _l11Ol.Playing)then _l11Ol:Play();end;else _l1110 .Text=_D(181);_l1110 .TextColor3=_llO0O.TextDim;_l111O.BackgroundColor3=_llO0O.TextDim;_l11Ol:Cancel();_l111O.Size=UDim2 .fromOffset(10,10);end;end;_I0O0O=function()local _l11O0=_I010I;if _l1l1l then if _l11O0 then _l1l1l:Pause();else _l1l1l:Play();end;end;if _l1lOI then if _l11O0 then _l1lOI:Pause();else _l1lOI:Play();end;end;if _l11Ol then if _l11O0 then _l11Ol:Pause();elseif(_I01OI and(not _l11Ol.Playing))then _l11Ol:Play();end;end;if(_l11I0 and _l11I0 .Parent)then _l11I0 .Visible=not _l11O0;end;end;local _l110I={};local _l110l=104;local function _l1101(_l110O)local _l1100=_l110l;_l110l=(_l110l+_l110O)+6;return _l1100;end;local function _l1OII(_l1OIl,_l1OI1,_l1OIO)local _l1OI0=_l1101(40);local _l1OlI=_llO00(_D(182),{Size=UDim2 .new(1,-24,0,40),Position=UDim2 .new(0,12,0,_l1OI0),BackgroundColor3=_llO0O.PanelDark,Text=_D(183),AutoButtonColor=false,Parent=_l1llO,ZIndex=2});_ll0lO(_l1OlI,10);local _l1Oll=_ll01O(_l1OlI,_llO0O.Stroke,1,0);_l1IO1(_l1OlI,_l1OlI,0.85);_llO00(_D(184),{Size=UDim2 .new(1,-80,1,0),Position=UDim2 .new(0,12,0,0),BackgroundTransparency=1,Text=_l1OIl,Font=(Enum.Font).GothamBold,TextSize=13,TextColor3=_llO0O.Text,TextXAlignment=(Enum.TextXAlignment).Left,Parent=_l1OlI,ZIndex=3});local _l1Ol1=_llO00(_D(185),{AnchorPoint=Vector2 .new(1,0.5),Position=UDim2 .new(1,-12,0.5,0),Size=UDim2 .fromOffset(42,22),BackgroundColor3=(_l1OI1 and _llO0O.Red)or _llO0O.Panel,Parent=_l1OlI,ZIndex=3});_ll01l(_l1Ol1);local _l1OlO=_ll01O(_l1Ol1,(_l1OI1 and _llO0O.RedGlow)or _llO0O.Stroke,1,0);local _l1Ol0=_ll01O(_l1Ol1,_llO0O.RedGlow,3,1);local _l1O1I=_llO00(_D(186),{Scale=1,Parent=_l1Ol1});local _l1O1l=_llO00(_D(187),{AnchorPoint=Vector2 .new(0.5,0.5),Size=UDim2 .fromOffset(16,16),Position=UDim2 .new(0,(_l1OI1 and 31)or 11,0.5,0),BackgroundColor3=(_l1OI1 and Color3 .fromRGB(255,255,255))or _llO0O.TextDim,Parent=_l1Ol1,ZIndex=4});_ll01l(_l1O1l);local _l1O11=_l1OI1;local function _l1O1O(_l1O10)local _l1OOI=(_l1O10 and TweenInfo.new(0))or TweenInfo.new(0.22,(Enum.EasingStyle).Back,(Enum.EasingDirection).Out);(_I01Il:Create(_l1O1l,_l1OOI,{Position=(_l1O11 and UDim2 .new(0,31,0.5,0))or UDim2 .new(0,11,0.5,0),BackgroundColor3=(_l1O11 and Color3 .fromRGB(255,255,255))or _llO0O.TextDim})):Play();(_I01Il:Create(_l1Ol1,_l1OOI,{BackgroundColor3=(_l1O11 and _llO0O.Red)or _llO0O.Panel})):Play();(_I01Il:Create(_l1OlO,_l1OOI,{Color=(_l1O11 and _llO0O.RedGlow)or _llO0O.Stroke})):Play();(_I01Il:Create(_l1Oll,_l1OOI,{Color=(_l1O11 and _llO0O.Red)or _llO0O.Stroke,Transparency=(_l1O11 and 0.1)or 0})):Play();end;_l1O1O(true);(_l1OlI.Activated):Connect(function()_l1O11=not _l1O11;_l1O1O(false);if _l1O11 then _l1Ol0 .Transparency=0.1;(_ll0OO(_l1Ol0,0.5,{Transparency=1},(Enum.EasingStyle).Quad)):Play();end;_l1II1(_l1O1I,(_l1O11 and 1.28)or 1.16);_l1OIO(_l1O11);end);table.insert(_l110I,_l1OlI);return _l1OlI;end;local function _l1OOl(_l1OO1,_l1OOO,_l1OO0,_l1O0I)local _l1O0l=_l1101(36);local _l1O01=_llO00(_D(188),{Size=UDim2 .new(1,-24,0,36),Position=UDim2 .new(0,12,0,_l1O0l),BackgroundColor3=_llO0O.PanelDark,Text=_D(189),AutoButtonColor=false,Parent=_l1llO,ZIndex=2});_ll0lO(_l1O01,10);local _l1O0O=_ll01O(_l1O01,_llO0O.Stroke,1,0);_l1IO1(_l1O01,_l1O01,0.85);_llO00(_D(190),{Size=UDim2 .new(0,110,1,0),Position=UDim2 .new(0,12,0,0),BackgroundTransparency=1,Text=_l1OO1,Font=(Enum.Font).GothamBold,TextSize=12,TextColor3=_llO0O.Text,TextXAlignment=(Enum.TextXAlignment).Left,Parent=_l1O01,ZIndex=3});local _l1O00=_llO00(_D(191),{AnchorPoint=Vector2 .new(1,0.5),Position=UDim2 .new(1,-66,0.5,0),Size=UDim2 .new(0,132,0,20),BackgroundTransparency=1,ClipsDescendants=true,Parent=_l1O01,ZIndex=3});local _l10II=_llO00(_D(192),{Size=UDim2 .new(1,0,1,0),Position=UDim2 .new(0,0,0,0),BackgroundTransparency=1,Text=_l1OOO[_l1OO0],Font=(Enum.Font).GothamBlack,TextSize=12,TextColor3=_llO0O.RedGlow,TextXAlignment=(Enum.TextXAlignment).Right,TextTruncate=(Enum.TextTruncate).AtEnd,Parent=_l1O00,ZIndex=4});local function _l10Il(_l10I1,_l10IO)local _l10I0=_llO00(_D(193),{Size=UDim2 .fromOffset(24,24),Position=UDim2 .new(1,_l10I1,0.5,-12),BackgroundColor3=_llO0O.Panel,Text=_l10IO,Font=(Enum.Font).GothamBlack,TextSize=14,TextColor3=_llO0O.TextDim,AutoButtonColor=false,Parent=_l1O01,ZIndex=4});_ll0lO(_l10I0,7);_l1I1l(_l10I0,0.8);return _l10I0;end;local _l10lI=_l10Il(-62,_D(194));local _l10ll=_l10Il(-32,_D(195));local _l10l1=_l1OO0;local _l10lO=0;local function _l10l0(_l101I,_l101l)_l10lO=_l10lO+1;local _l1011=_l10lO;task.spawn(function()local _l101O=_ll0OO(_l10II,0.1,{TextTransparency=1,Position=UDim2 .new(0,_l101l*(-22),0,0)},(Enum.EasingStyle).Quad,(Enum.EasingDirection).In);_l101O:Play();(_l101O.Completed):Wait();if((_l1011~=_l10lO)or(not _l10II.Parent))then return;end;_l10II.Text=_l101I;_l10II.Position=UDim2 .new(0,_l101l*22,0,0);(_ll0OO(_l10II,0.32,{TextTransparency=0,Position=UDim2 .new(0,0,0,0)},(Enum.EasingStyle).Back)):Play();end);end;local function _l1010(_l10OI)_l10OI.TextColor3=_llO0O.RedGlow;(_ll0OO(_l10OI,0.4,{TextColor3=_llO0O.TextDim},(Enum.EasingStyle).Quad)):Play();end;local function _l10Ol()_l1O0O.Color=_llO0O.Red;(_ll0OO(_l1O0O,0.5,{Color=_llO0O.Stroke},(Enum.EasingStyle).Quad)):Play();end;local function _l10O1(_l10OO)_l10l1=(((_l10l1-1)+_l10OO)%(#_l1OOO))+1;_l10l0(_l1OOO[_l10l1],_l10OO);_l1O0I(_l10l1,_l1OOO[_l10l1]);_l10Ol();end;(_l10lI.Activated):Connect(function()_l1010(_l10lI);_l10O1(-1);end);(_l10ll.Activated):Connect(function()_l1010(_l10ll);_l10O1(1);end);(_l1O01 .Activated):Connect(function()_l10O1(1);end);table.insert(_l110I,_l1O01);return _l1O01;end;local _l10O0=_llO00(_D(196),{Name=_D(197),AnchorPoint=Vector2 .new(0.5,0),Position=UDim2 .new(0.5,0,0,12),Size=UDim2 .fromOffset(118,34),BackgroundColor3=Color3 .fromRGB(8,8,10),BackgroundTransparency=0.12,BorderSizePixel=0,ClipsDescendants=true,GroupTransparency=1,Visible=false,Parent=_I0100});_ll01l(_l10O0);_ll01O(_l10O0,_llO0O.Glass,1,0.82);_l1Ill(_l10O0,10,17);local _l100I=_llO00(_D(198),{Scale=1,Parent=_l10O0});local _l100l=_llO00(_D(199),{AnchorPoint=Vector2 .new(0,0.5),Size=UDim2 .fromOffset(26,16),Position=UDim2 .new(0,8,0.5,-1),BackgroundTransparency=1,Text=_D(200),Font=(Enum.Font).Code,TextSize=12,TextColor3=_llO0O.TextDim,TextXAlignment=(Enum.TextXAlignment).Center,Parent=_l10O0});local _l1001=_llO00(_D(201),{Scale=1,Parent=_l100l});do local _l100O,_l1000,_lOIII,_lOIIl=_D(202),_D(203),_D(204),_D(205);local _lOII1=os.clock();local _lOIIO=os.clock()+math.random(5,10);local _lOII0=false;task.spawn(function()while _I0O0I do if(not _l100l.Parent)then break;end;local _lOIlI=os.clock();if((not _lOII0)and(_lOIlI>=_lOIIO))then _lOII0=true;_lOIIO=_lOIlI+math.random(7,14);(_ll0OO(_l1001,0.1,{Scale=1.2},(Enum.EasingStyle).Back)):Play();_l100l.Text=_l100O;task.wait(0.12);if(not _l100l.Parent)then break;end;_l100l.Text=_lOIIl;(_ll0OO(_l100l,0.32,{Position=UDim2 .new(0,8,0.5,-9)},(Enum.EasingStyle).Back,(Enum.EasingDirection).Out)):Play();task.wait(0.34);if(not _l100l.Parent)then break;end;(_ll0OO(_l100l,0.45,{Position=UDim2 .new(0,8,0.5,-1)},(Enum.EasingStyle).Elastic,(Enum.EasingDirection).Out)):Play();task.wait(0.24);if(not _l100l.Parent)then break;end;_l100l.Text=_lOIII;task.wait(0.55);if(not _l100l.Parent)then break;end;(_ll0OO(_l1001,0.3,{Scale=1},(Enum.EasingStyle).Elastic)):Play();_l100l.Text=_l100O;_lOII0=false;elseif((not _lOII0)and((_lOIlI-_lOII1)>=3.8))then _lOII1=_lOIlI;_l100l.Text=_l1000;task.wait(0.14);if(not _l100l.Parent)then break;end;_l100l.Text=_l100O;end;task.wait(0.1);end;end);end;local _lOIll=_llO00(_D(206),{Size=UDim2 .new(1,-70,1,0),Position=UDim2 .new(0,36,0,0),BackgroundTransparency=1,Text=_D(207),Font=(Enum.Font).GothamBold,TextSize=12,TextColor3=_llO0O.Text,TextXAlignment=(Enum.TextXAlignment).Left,Parent=_l10O0});local _lOIl1=_llO00(_D(208),{AnchorPoint=Vector2 .new(1,0.5),Size=UDim2 .fromOffset(6,6),Position=UDim2 .new(1,-10,0.5,0),BackgroundColor3=_llO0O.TextDim,BorderSizePixel=0,Parent=_l10O0});_ll01l(_lOIl1);local _lOIlO=_llO00(_D(209),{Size=UDim2 .new(1,0,1,0),BackgroundTransparency=1,Text=_D(210),Parent=_l10O0});local _lOIl0=_llO00(_D(211),{AnchorPoint=Vector2 .new(0.5,0.5),Position=UDim2 .new(0.5,0,0,29),Size=UDim2 .fromOffset(34,34),BackgroundTransparency=1,BorderSizePixel=0,ZIndex=4,Parent=_I0100});_ll01l(_lOIl0);local _lOI1I=_ll01O(_lOIl0,_llO0O.Glass,2.5,1);local _lOI1l=nil;local function _lOI11(_lOI1O)if(not _l100I.Parent)then return;end;if _lOI1l then _lOI1l:Cancel();end;_l100I.Scale=_lOI1O;_lOI1l=_ll0OO(_l100I,0.6,{Scale=1},(Enum.EasingStyle).Elastic);_lOI1l:Play();end;local _lOI10=0;local function _lOIOI()if _I010I then return;end;if(not _l10O0 .Parent)then return;end;_lOI10=_lOI10+1;local _lOIOl=_lOI10;task.spawn(function()for _lOIO1,_lOIOO in ipairs({-3.5,3,-2,1,0})do if((_lOIOl~=_lOI10)or(not _l10O0 .Parent))then return;end;local _lOIO0=_ll0OO(_l10O0,0.08,{Rotation=_lOIOO},(Enum.EasingStyle).Quad);_lOIO0:Play();(_lOIO0 .Completed):Wait();end;end);end;_I0O0l=function()if((not _I01O0)or _I010I)then return;end;if(_l1lII and _l1lII.Parent)then _l1lII.GroupTransparency=0.55;(_ll0OO(_l1lII,0.26,{GroupTransparency=1},(Enum.EasingStyle).Quad,(Enum.EasingDirection).Out)):Play();end;if(_lOIl0 and _lOIl0 .Parent)then _lOIl0 .Size=UDim2 .fromOffset(34,34);_lOI1I.Transparency=0.3;(_ll0OO(_lOIl0,0.5,{Size=UDim2 .fromOffset(120,120)},(Enum.EasingStyle).Quint,(Enum.EasingDirection).Out)):Play();(_ll0OO(_lOI1I,0.5,{Transparency=1},(Enum.EasingStyle).Quint,(Enum.EasingDirection).Out)):Play();end;end;local _lOI0I=false;local function _lOI0l()if _lOI0I then return;end;_lOI0I=true;_l1llO.Visible=true;_l1l11 .Scale=_l1lOl*0.7;_l1llO.GroupTransparency=1;_l1llO.Rotation=-2.5;(_ll0OO(_l1llO,0.3,{GroupTransparency=0})):Play();(_l1l01(1,0.5,(Enum.EasingStyle).Back)):Play();(_ll0OO(_l1llO,0.65,{Rotation=0},(Enum.EasingStyle).Elastic)):Play();_l1II1(_l11I1,1.3);_lOI11(1.14);_lOIOI();for _lOI01,_lOI0O in ipairs(_l110I)do if _lOI0O.Parent then local _lOI00=_lOI0O.Position;_lOI0O.Position=UDim2 .new((_lOI00 .X).Scale,(_lOI00 .X).Offset,(_lOI00 .Y).Scale,(_lOI00 .Y).Offset+18);task.delay(_lOI01*0.032,function()if _lOI0O.Parent then(_ll0OO(_lOI0O,0.5,{Position=_lOI00},(Enum.EasingStyle).Back,(Enum.EasingDirection).Out)):Play();end;end);end;end;end;local function _lOlII()if(not _lOI0I)then return;end;_lOI0I=false;(_l1l01(0.8,0.2)):Play();local _lOlIl=_ll0OO(_l1llO,0.2,{GroupTransparency=1,Rotation=-1.5},(Enum.EasingStyle).Quad,(Enum.EasingDirection).In);_lOlIl:Play();(_lOlIl.Completed):Connect(function()if((not _lOI0I)and _l1llO.Parent)then _l1llO.Visible=false;end;end);end;(_lOIlO.Activated):Connect(function()_lOI11(1.12);if _lOI0I then _lOlII();else _lOI0l();end;end);(_l111l.Activated):Connect(function()_lOlII();end);(_l1111 .Activated):Connect(function()if _I0O01 then _I0O01();end;end);do local _lOlI1=false;local _lOlIO=nil;local _lOlI0=nil;(_l11Il.InputBegan):Connect(function(_lOllI)if((_lOllI.UserInputType==(Enum.UserInputType).MouseButton1)or(_lOllI.UserInputType==(Enum.UserInputType).Touch))then _lOlI1=true;_lOlIO=_lOllI.Position;_lOlI0=_l1llO.Position;(_lOllI.Changed):Connect(function()if(_lOllI.UserInputState==(Enum.UserInputState).End)then _lOlI1=false;if _l1llO.Parent then(_ll0OO(_l1llO,0.6,{Rotation=0},(Enum.EasingStyle).Elastic)):Play();end;end;end);end;end);(_I01I1 .InputChanged):Connect(function(_lOlll)if(_lOlI1 and((_lOlll.UserInputType==(Enum.UserInputType).MouseMovement)or(_lOlll.UserInputType==(Enum.UserInputType).Touch)))then local _lOll1=_lOlll.Position-_lOlIO;_l1llO.Position=UDim2 .new((_lOlI0 .X).Scale,(_lOlI0 .X).Offset+_lOll1 .X,(_lOlI0 .Y).Scale,(_lOlI0 .Y).Offset+_lOll1 .Y);if _l1llO.Parent then _l1llO.Rotation=math.clamp(_lOll1 .X*0.03,-4,4);end;end;end);(_I01I1 .InputEnded):Connect(function(_lOllO)if((_lOllO.UserInputType==(Enum.UserInputType).MouseButton1)or(_lOllO.UserInputType==(Enum.UserInputType).Touch))then _lOlI1=false;end;end);end;local _lOll0=_llO00(_D(212),{AnchorPoint=Vector2 .new(0.5,0.5),Position=UDim2 .new(0.5,0,0.5,0),Size=UDim2 .fromOffset(300,190),BackgroundColor3=_llO0O.Carbon,BackgroundTransparency=0.08,BorderSizePixel=0,GroupTransparency=1,Visible=true,ZIndex=50,Parent=_I0100});_ll0lO(_lOll0,24);_ll01O(_lOll0,_llO0O.RedGlow,1.4,0.5);_l1Ill(_lOll0,20,24);local _lOl1I=_llO00(_D(213),{Scale=0.7,Parent=_lOll0});local _lOl1l=_llO00(_D(214),{Scale=0,Parent=_lOll0});local _lOl11=_llO00(_D(215),{Size=UDim2 .fromOffset(46,46),Position=UDim2 .new(0.5,-23,0,18),BackgroundColor3=_llO0O.Red,Text=_D(216),Font=(Enum.Font).GothamBlack,TextSize=18,TextColor3=Color3 .fromRGB(255,255,255),ZIndex=51,Parent=_lOll0});_ll0lO(_lOl11,12);_ll01O(_lOl11,_llO0O.RedGlow,1.5,0.35);local _lOl1O=_llO00(_D(217),{Size=UDim2 .new(1,0,0,26),Position=UDim2 .new(0,0,0,70),BackgroundTransparency=1,Text=_D(218),Font=(Enum.Font).GothamBlack,TextSize=22,TextColor3=_llO0O.Text,TextTransparency=1,ZIndex=51,Parent=_lOll0});local _lOl10=_llO00(_D(219),{Size=UDim2 .new(1,0,0,12),Position=UDim2 .new(0,0,0,96),BackgroundTransparency=1,Text=_D(220),Font=(Enum.Font).GothamBold,TextSize=10,TextColor3=_llO0O.RedGlow,TextTransparency=1,ZIndex=51,Parent=_lOll0});local _lOlOI=_llO00(_D(221),{Size=UDim2 .new(1,-48,0,6),Position=UDim2 .new(0,24,0,122),BackgroundColor3=Color3 .fromRGB(40,40,46),BorderSizePixel=0,ZIndex=51,Parent=_lOll0});_ll0lO(_lOlOI,3);local _lOlOl=_llO00(_D(222),{Size=UDim2 .new(0,0,1,0),BackgroundColor3=_llO0O.RedGlow,BorderSizePixel=0,ZIndex=51,Parent=_lOlOI});_ll0lO(_lOlOl,3);local _lOlO1=_llO00(_D(223),{Size=UDim2 .new(1,-24,0,12),Position=UDim2 .new(0,12,0,138),BackgroundTransparency=1,Text=_D(224),Font=(Enum.Font).GothamBold,TextSize=10,TextColor3=_llO0O.TextDim,ZIndex=51,Parent=_lOll0});local _lOlOO=_llO00(_D(225),{Size=UDim2 .new(1,0,0,14),Position=UDim2 .new(0,0,0,156),BackgroundTransparency=1,Text=_D(226),Font=(Enum.Font).GothamBlack,TextSize=11,TextColor3=_llO0O.Text,ZIndex=51,Parent=_lOll0});local _lOlO0={};local _lOl0I=nil;local _lOl0l={};local _lOl01={Neon=true,ForceField=true};local function _lOl0O(_lOl00)if _lOlO0[_lOl00]then return;end;if _lOl00:IsA(_D(227))then return;end;pcall(function()if _lOl00:IsA(_D(228))then _lOlO0[_lOl00]={mat=_lOl00 .Material,shadow=_lOl00 .CastShadow,refl=_lOl00 .Reflectance};if(not _lOl01[_lOl00 .Material])then _lOl00 .Material=(Enum.Material).SmoothPlastic;end;_lOl00 .CastShadow=false;_lOl00 .Reflectance=0;elseif(_lOl00:IsA(_D(229))or _lOl00:IsA(_D(230)))then _lOlO0[_lOl00]={tr=_lOl00 .Transparency};_lOl00 .Transparency=1;elseif(((((_lOl00:IsA(_D(231))or _lOl00:IsA(_D(232)))or _lOl00:IsA(_D(233)))or _lOl00:IsA(_D(234)))or _lOl00:IsA(_D(235)))or _lOl00:IsA(_D(236)))then _lOlO0[_lOl00]={en=_lOl00 .Enabled};_lOl00 .Enabled=false;elseif _lOl00:IsA(_D(237))then _lOlO0[_lOl00]={en=_lOl00 .Enabled};_lOl00 .Enabled=false;elseif _lOl00:IsA(_D(238))then _lOlO0[_lOl00]={vis=_lOl00 .Visible};_lOl00 .Visible=false;else return;end;end);end;local function _lO1II()if _lOl0I then _lOl0I:Disconnect();_lOl0I=nil;end;for _lO1Il,_lO1I1 in pairs(_lOlO0)do pcall(function()if(_lO1Il and _lO1Il.Parent)then if(_lO1I1 .mat~=nil)then _lO1Il.Material=_lO1I1 .mat;_lO1Il.CastShadow=_lO1I1 .shadow;_lO1Il.Reflectance=_lO1I1 .refl;end;if(_lO1I1 .tr~=nil)then _lO1Il.Transparency=_lO1I1 .tr;end;if(_lO1I1 .en~=nil)then _lO1Il.Enabled=_lO1I1 .en;end;if(_lO1I1 .vis~=nil)then _lO1Il.Visible=_lO1I1 .vis;end;end;end);_lOlO0[_lO1Il]=nil;end;end;local function _lO1IO(_lO1I0)local _lO1lI=game:GetService(_D(239));if _lO1I0 then _lOl0l={};pcall(function()_lOl0l.shadows=_lO1lI.GlobalShadows;end);pcall(function()_lOl0l.diff=_lO1lI.EnvironmentDiffuseScale;end);pcall(function()_lOl0l.spec=_lO1lI.EnvironmentSpecularScale;end);pcall(function()local _lO1ll=_I0l0O.Terrain;_lOl0l.deco=_lO1ll.Decoration;_lOl0l.wsize=_lO1ll.WaterWaveSize;_lOl0l.wspeed=_lO1ll.WaterWaveSpeed;_lOl0l.wrefl=_lO1ll.WaterReflectance;end);pcall(function()_lO1lI.GlobalShadows=false;end);pcall(function()_lO1lI.EnvironmentDiffuseScale=0;end);pcall(function()_lO1lI.EnvironmentSpecularScale=0;end);pcall(function()local _lO1l1=_I0l0O.Terrain;_lO1l1 .Decoration=false;_lO1l1 .WaterWaveSize=0;_lO1l1 .WaterWaveSpeed=0;_lO1l1 .WaterReflectance=0;end);pcall(function()((settings()).Rendering).QualityLevel=(Enum.QualityLevel).Level1;end);for _lO1lO,_lO1l0 in ipairs(_I0l0O:GetDescendants())do _lOl0O(_lO1l0);end;_lOl0I=(_I0l0O.DescendantAdded):Connect(function(_lO11I)task.defer(_lOl0O,_lO11I);end);else _lO1II();pcall(function()_lO1lI.GlobalShadows=_lOl0l.shadows;end);pcall(function()_lO1lI.EnvironmentDiffuseScale=_lOl0l.diff;end);pcall(function()_lO1lI.EnvironmentSpecularScale=_lOl0l.spec;end);pcall(function()local _lO11l=_I0l0O.Terrain;_lO11l.Decoration=_lOl0l.deco;_lO11l.WaterWaveSize=_lOl0l.wsize;_lO11l.WaterWaveSpeed=_lOl0l.wspeed;_lO11l.WaterReflectance=_lOl0l.wrefl;end);pcall(function()((settings()).Rendering).QualityLevel=(Enum.QualityLevel).Automatic;end);end;end;_l1OII(_D(240),_I01OI,function(_lO111)_I01OI=_lO111;_l11O1(_lO111);_I00I1((_lO111 and _D(241))or _D(242),1);end);_l1OII(_D(243),_I01OO,function(_lO11O)_I01OO=_lO11O;if(not _lO11O)then _I0OlO=false;end;_I00I1((_lO11O and _D(244))or _D(245),1.2);end);_l1OII(_D(246),_I01O0,function(_lO110)_I01O0=_lO110;end);_l1OII(_D(247),_I01O1,function(_lO1OI)_I01O1=_lO1OI;local _lO1Ol=_I01IO.Character;local _lO1O1=_lO1Ol and _lO1Ol:FindFirstChild(_D(248));if _lO1O1 then _lO1O1 .Enabled=_lO1OI;end;end);_l1OII(_D(249),_I01Ol,function(_lO1OO)_I01Ol=_lO1OO;_lIIl1 .Transparency=(_lO1OO and 0)or 1;end);_l1OII(_D(250),_I010I,function(_lO1O0)_I010I=_lO1O0;xpcall(function()_lO1IO(_lO1O0);end,function()end);if _I0O0O then xpcall(function()_I0O0O();end,function()end);end;_I00I1((_lO1O0 and _D(251))or _D(252),1.4);if _lO1O0 then _lOI11(1.1);end;end);_l1OOl(_D(253),{_D(254),_D(255),_D(256),_D(257),_D(258)},1,function(_lO10I,_lO10l)_I010l=({_D(259),_D(260),_D(261),_D(262),_D(263)})[_lO10I];_I00I1(_D(264).._lO10l,1.2);end);_l1OOl(_D(265),{_D(266),_D(267),_D(268),_D(269),_D(270),_D(271),_D(272),_D(273),_D(274),_D(275),_D(276)},1,function(_lO101,_lO10O)_I0101=_lO10O;_I00I1(_D(277).._lO10O,1.2);end);local _lO100=_l110l+2;_l110l=(_lO100+54)+6;local _lOOII=_llO00(_D(278),{Size=UDim2 .new(1,-24,0,54),Position=UDim2 .new(0,12,0,_lO100),BackgroundColor3=_llO0O.PanelDark,BorderSizePixel=0,Parent=_l1llO});_ll0lO(_lOOII,10);_ll01O(_lOOII,_llO0O.Stroke,1,0);local function _lOOIl(_lOOI1,_lOOIO)local _lOOI0=_llO00(_D(279),{Size=UDim2 .new(1/4,0,1,0),Position=UDim2 .new((_lOOI1-1)/4,0,0,0),BackgroundTransparency=1,Parent=_lOOII});if(_lOOI1>1)then _llO00(_D(280),{Size=UDim2 .new(0,1,1,-16),Position=UDim2 .new(0,0,0,8),BackgroundColor3=_llO0O.Stroke,BorderSizePixel=0,Parent=_lOOI0});end;local _lOOlI=_llO00(_D(281),{Size=UDim2 .new(1,0,0,22),Position=UDim2 .new(0,0,0,8),BackgroundTransparency=1,Text=_D(282),Font=(Enum.Font).GothamBlack,TextSize=14,TextColor3=_llO0O.Text,Parent=_lOOI0});_llO00(_D(283),{Size=UDim2 .new(1,0,0,12),Position=UDim2 .new(0,0,0,30),BackgroundTransparency=1,Text=_lOOIO,Font=(Enum.Font).GothamBold,TextSize=8,TextColor3=_llO0O.TextDim,Parent=_lOOI0});return _lOOlI;end;local _lOOll=_lOOIl(1,_D(284));local _lOOl1=_lOOIl(2,_D(285));local _lOOlO=_lOOIl(3,_D(286));local _lOOl0=_lOOIl(4,_D(287));local _lOO1I=_llO00(_D(288),{Size=UDim2 .new(1,-24,0,14),Position=UDim2 .new(0,12,0,_l110l),BackgroundTransparency=1,Text=_D(289),Font=(Enum.Font).GothamBold,TextSize=9,TextColor3=_llO0O.Amber,TextXAlignment=(Enum.TextXAlignment).Left,Parent=_l1llO});_l110l=_l110l+20;local _lOO1l=_l1101(32);local function _lOO11(_lOO1O,_lOO10,_lOOOI)local _lOOOl=_llO00(_D(290),{Size=UDim2 .new(0.5,-16,0,32),Position=UDim2 .new(_lOO10,((_lOO10==0)and 12)or 4,0,_lOO1l),BackgroundColor3=_llO0O.Panel,Text=_lOO1O,Font=(Enum.Font).GothamBold,TextSize=10,TextColor3=_llO0O.Text,AutoButtonColor=false,Parent=_l1llO});_ll0lO(_lOOOl,9);_ll01O(_lOOOl,_llO0O.Stroke,1,0);_l1I1l(_lOOOl,0.9);(_lOOOl.Activated):Connect(function()_lOOOl.TextColor3=_llO0O.RedGlow;(_ll0OO(_lOOOl,0.5,{TextColor3=_llO0O.Text},(Enum.EasingStyle).Quad)):Play();_lOOOI();end);return _lOOOl;end;_lOO11(_D(291),0,function()local _lOOO1=_lIl10();_I00I1((_lOOO1 and _D(292))or _D(293),1.4);if _lOOO1 then _lOI11(1.1);end;end);_lOO11(_D(294),0.5,function()_lIlI1 .captured=nil;_lIlI1 .capturedArgs=nil;_lIlI1 .announced=false;for _lOOOO in pairs(_lIlI0)do _lIlI0[_lOOOO]=nil;end;_I00I1(_D(295),1.4);end);local _lOOO0=_l110l+8;_llO00(_D(296),{Size=UDim2 .new(1,-24,0,1),Position=UDim2 .new(0,12,0,_lOOO0-5),BackgroundColor3=_llO0O.Stroke,BackgroundTransparency=0.5,BorderSizePixel=0,Parent=_l1llO});_llO00(_D(297),{Size=UDim2 .new(0,190,0,18),Position=UDim2 .new(0,14,0,_lOOO0),BackgroundTransparency=1,Text=_D(298),Font=(Enum.Font).GothamBold,TextSize=9,TextColor3=_llO0O.TextDim,TextTransparency=0.3,TextXAlignment=(Enum.TextXAlignment).Left,Parent=_l1llO});local _lOO0I=_llO00(_D(299),{Size=UDim2 .new(0,90,0,18),Position=UDim2 .new(1,-14,0,_lOOO0),BackgroundTransparency=1,Text=_D(300),Font=(Enum.Font).GothamBold,TextSize=9,TextColor3=_llO0O.TextDim,TextXAlignment=(Enum.TextXAlignment).Right,Parent=_l1llO});_l1llI=_lOOO0+30;_l1llO.Size=UDim2 .fromOffset(_l1lI0,_l1llI);_l1lOO();_I0O01=function()_I01OI=false;_I0O0I=false;_I0OlO=false;if _I010O then _I010O:Disconnect();_I010O=nil;end;for _lOO0l,_lOO01 in ipairs(_I0OO0)do pcall(function()_lOO01:Disconnect();end);end;_I0OO0={};if _I010I then _I010I=false;xpcall(function()_lO1IO(false);end,function()end);end;pcall(function()_I0100:Destroy();end);pcall(function()_lIIl1:Destroy();end);local _lOO0O=_I01IO.Character;local _lOO00=_lOO0O and _lOO0O:FindFirstChild(_D(301));if _lOO00 then _lOO00:Destroy();end;end;local _lO0II=false;_I0ll1(_D(302));task.spawn(function()pcall(function()(_ll0OO(_lOll0,0.4,{GroupTransparency=0})):Play();(_ll0OO(_lOl1I,0.6,{Scale=1},(Enum.EasingStyle).Back)):Play();task.wait(0.18);(_ll0OO(_lOl1l,0.7,{Scale=1},(Enum.EasingStyle).Elastic)):Play();_lOl1O.Position=UDim2 .new(0,0,0,78);(_ll0OO(_lOl1O,0.45,{TextTransparency=0,Position=UDim2 .new(0,0,0,70)})):Play();(_ll0OO(_lOl10,0.55,{TextTransparency=0})):Play();task.wait(0.3);local _lO0Il={{0,_D(303)},{0.22,_D(304)},{0.48,_D(305)},{0.72,_D(306)},{0.92,_D(307)}};local _lO0I1,_lO0IO=0,(_lO0Il[1])[2];while(_lO0I1<1)do _lO0I1=math.min(1,_lO0I1+(math.random(22,60)/1000));local _lO0I0=(_lO0Il[1])[2];for _lO0lI,_lO0ll in ipairs(_lO0Il)do if(_lO0I1>=_lO0ll[1])then _lO0I0=_lO0ll[2];end;end;if(_lO0I0~=_lO0IO)then _lO0IO=_lO0I0;_lOlO1 .Text=_lO0I0;end;_lOlOO.Text=tostring(math.floor(_lO0I1*100)).._D(308);(_ll0OO(_lOlOl,0.3,{Size=UDim2 .new(_lO0I1,0,1,0)},(Enum.EasingStyle).Quart)):Play();task.wait(math.random(8,18)/100);end;_lOlOO.Text=_D(309);_lOlO1 .Text=_D(310);_lIl10();task.wait(0.45);local _lO0l1=_ll0OO(_lOll0,0.26,{GroupTransparency=1},(Enum.EasingStyle).Quint,(Enum.EasingDirection).In);(_ll0OO(_lOl1I,0.3,{Scale=1.06},(Enum.EasingStyle).Back,(Enum.EasingDirection).In)):Play();task.wait(0.12);(_ll0OO(_lOl1I,0.2,{Scale=0.85},(Enum.EasingStyle).Quint,(Enum.EasingDirection).In)):Play();_lO0l1:Play();(_lO0l1 .Completed):Wait();pcall(function()_lOll0:Destroy();end);end);pcall(function()_l10O0 .Visible=true;_l10O0 .GroupTransparency=1;(_ll0OO(_l10O0,0.3,{GroupTransparency=0})):Play();end);_lO0II=true;_I0ll1(_D(311));pcall(function()_lOI11(1.2);_lOIOI();_I00I1(_D(312),2);if _lIlI1 .tokenOk then _I00I1(_D(313),2.2);elseif(not _I01l0)then _I00I1(_D(314),2.4);end;_lOI0l();end);end);task.delay(9,function()if _lO0II then return;end;_I0ll1(_D(315),true);pcall(function()if(_lOll0 and _lOll0 .Parent)then _lOll0:Destroy();end;end);pcall(function()if(_l10O0 and(not _l10O0 .Visible))then _l10O0 .Visible=true;_l10O0 .GroupTransparency=1;(_ll0OO(_l10O0,0.3,{GroupTransparency=0})):Play();end;end);pcall(function()_lOI0l();end);_lO0II=true;end);local _lO0lO={[_D(316)]=_llO0O.TextDim,[_D(317)]=_llO0O.TextDim,[_D(318)]=_llO0O.TextDim,[_D(319)]=_llO0O.TextDim,[_D(320)]=_llO0O.Amber,[_D(321)]=_llO0O.Amber,[_D(322)]=_llO0O.Amber,[_D(323)]=_llO0O.Amber,[_D(324)]=_llO0O.Good,[_D(325)]=_llO0O.RedGlow,[_D(326)]=_llO0O.Text,[_D(327)]=_llO0O.Good,[_D(328)]=_llO0O.Good,[_D(329)]=_llO0O.RedGlow,[_D(330)]=_llO0O.TextDim,[_D(331)]=_llO0O.Good,[_D(332)]=_llO0O.TextDim};local _lO0l0=nil;local _lO01I,_lO01l={},{};local function _lO011(_lO01O,_lO010,_lO0OI)if(not _lO01O.Parent)then return;end;if(_lO01I[_lO010]~=_lO0OI)then _lO01I[_lO010]=_lO0OI;_lO01O.Text=_lO0OI;end;end;local function _lO0Ol(_lO0O1,_lO0OO,_lO0O0)if(not _lO0O1 .Parent)then return;end;if(_lO01l[_lO0OO]~=_lO0O0)then _lO01l[_lO0OO]=_lO0O0;_lO0O1 .TextColor3=_lO0O0;end;end;local function _lO00I(_lO00l,_lO001,_lO00O)local _lO000=_I00l1();local _l0III=_lO0lO[_lO000]or _llO0O.Text;if _lOIll.Parent then if(_lO000~=_lO0l0)then _lO0l0=_lO000;_lOIll.Text=_lO000;_lOIl1 .BackgroundColor3=_l0III;_lOIll.TextColor3=((_lO000==_D(333))and _llO0O.TextDim)or _llO0O.Text;if(((_lO000~=_D(334))and(_lO000~=_D(335)))and(_lO000~=_D(336)))then _lOI11(1.08);end;end;end;local _l0IIl=_D(337);local _l0II1=_llO0O.TextDim;if(_I00OI and(_I00OI>0))then _l0IIl=tostring(math.floor(_I00OI)).._D(338);if(_I00OI<80)then _l0II1=_llO0O.Good;elseif(_I00OI<160)then _l0II1=_llO0O.Amber;else _l0II1=_llO0O.Bad;end;end;_lO011(_lOOll,_D(339),_l0IIl);_lO0Ol(_lOOll,_D(340),_l0II1);if(_lO00l and _lO001)then local _l0IIO=_lIIl0(_lO00l);local _l0II0=_l0IIO.Magnitude;_lO011(_lOOl1,_D(341),tostring(math.floor(_l0II0)));_lO011(_lOOlO,_D(342),tostring(math.floor(_lI00l(_l0II0,_lO00O))));else _lO011(_lOOl1,_D(343),_D(344));_lO011(_lOOlO,_D(345),_D(346));end;if _lOOl0 .Parent then local _l0IlI=math.floor(_lIIIl()*1000);_lO011(_lOOl0,_D(347),tostring(_l0IlI).._D(348));local _l0Ill=((_l0IlI>250)and _llO0O.Bad)or(((_l0IlI>120)and _llO0O.Amber)or _llO0O.Text);_lO0Ol(_lOOl0,_D(349),_l0Ill);end;if _lOO0I.Parent then _lO011(_lOO0I,_D(350),_D(351)..tostring(_I0OIl));end;if _lOO1I.Parent then local _l0Il1=(_lIlI1 .tokenOk and _D(352))or((_I01l0 and _D(353))or _D(354));local _l0IlO=((_lIlI1 .captured~=nil)and _D(355))or _D(356);_lO011(_lOO1I,_D(357),_D(358)..(_l0Il1 ..(_D(359).._l0IlO)));_lO0Ol(_lOO1I,_D(360),((_lIlI1 .tokenOk and(_lIlI1 .captured~=nil))and _llO0O.Good)or _llO0O.Amber);end;end;local _l0Il0=0;_I010O=(_I0l00 .RenderStepped):Connect(function()pcall(function()_I0OII=_I0OII+1;local _l0I1I=_I00O1()/1000;local _l0I1l=_lII10();local _l0I11=_I01IO.Character;local _l0I1O=_l0I11 and _l0I11:FindFirstChild(_D(361));local _l0I10=nil;if(_l0I1l and _l0I1O)then local _l0IOI=_l0I1l:FindFirstChild(_D(362));if _l0IOI then local _l0IOl=_l0IOI.VectorVelocity;local _l0IO1=_lIIIl();local _l0IOO=_llIIO(_l0I1l,_l0IOI,_l0IO1);_l0I10={vel=_l0IOl,speed=_l0IOl.Magnitude,serverPos=_l0IOO,offset=_l0IO1};_lIIl1 .Position=_l0IOO;else _lIIl1 .Position=_l0I1l.Position+(_lIIl0(_l0I1l)*_lIIIl());end;if(_I01O1 and(not _l0I11:FindFirstChild(_D(363))))then _lIII0();end;else _lIIl1 .Position=Vector3 .new(0,-100,0);end;if(((_I01OO and _l0I1l)and(not _I0OOl))and(not _I0OO1))then local _l0IO0=_l0I1l:GetAttribute(_D(364));local _l0I0I,_l0I0l=_lII0l(_l0I1l);local _l0I01=(_l0IO0==_I01IO.Name)and(_l0I0l~=nil);local _l0I0O=(_l0I1O~=nil)and((_l0I1O:FindFirstChild(_D(365))~=nil)or(_l0I1l:FindFirstChild(_D(366))~=nil));if _l0I01 then local _l0I00=(_l0I0l.Position-_l0I1l.Position).Magnitude;if((((not _I0OlO)and(os.clock()>=_I0O1I))and(_l0I00<=15))and(not _l0I0O))then _I0OlO=true;_I0Ol0=0;_I00I1(_D(367),1.4);_lOI11(1.25);_I0O0l();elseif(_I0OlO and((_l0I00>22)or _l0I0O))then _I0OlO=false;_I0O1I=os.clock()+0.6;_I00I1(_D(368),0.8);end;elseif _I0OlO then _I0OlO=false;_I0O1I=os.clock()+0.6;end;elseif _I0OlO then _I0OlO=false;_I0O1I=os.clock()+0.6;end;if(((_I0OlO and(_I0Ol0<14))and((os.clock()-_I0Oll)>=0.09))and((os.clock()-_I0O1l)>=0.09))then _I0Oll=os.clock();_I0O1l=os.clock();if _llIO0(_lIOO1())then _I0Ol1=_I0Ol1+1;_I0Ol0=_I0Ol0+1;if(_I0Ol0>=14)then _I0OlO=false;_I0O1I=os.clock()+1;end;end;end;if _I01OI then if(_l0I1l and _l0I1O)then local _l0lII=_l0I1l:FindFirstChild(_D(369));if _l0lII then local _l0lIl=_l0I1l:GetAttribute(_D(370));if((_l0lIl~=nil)and(_I0OOI[_l0I1l]~=_l0lIl))then _I0OOI[_l0I1l]=_l0lIl;_I0O11=0;_I0O1O=0;_I0O10=-1;end;local _l0lI1,_l0lIO;if _l0I10 then _l0lI1=_l0I10 .speed;_l0lIO=_l0I10 .serverPos;else _l0lI1=(_l0lII.VectorVelocity).Magnitude;_l0lIO=_l0I1l.Position+(_l0lII.VectorVelocity*_lIIIl());end;local _l0lI0=(_l0I10 and _l0I10 .vel)or _l0lII.VectorVelocity;local _l0llI=(_l0lIO-_l0I1O.Position).Magnitude;local _l0lll=(_l0I1O.Position-_l0I1l.Position).Magnitude;local _l0ll1=_lI00l(_l0lI1,_l0I1I);local _l0llO,_l0ll0=math.huge,math.huge;if(_l0lI1>1)then local _l0l1I=_l0lI0 .Unit;local _l0l1l=_l0I1O.Position-_l0I1l.Position;local _l0l11=_l0l1l:Dot(_l0l1I);if(_l0l11>0)then _l0llO=_l0l11/_l0lI1;_l0ll0=(_l0l1l-(_l0l1I*_l0l11)).Magnitude;end;end;local _l0l1O=_llI10(_l0lI1);local _l0l10=math.max(_l0ll1*0.55,12);local _l0lOI=(_l0llO<=_l0l1O)and(_l0ll0<=_l0l10);local _l0lOl=_l0lll;local _l0lO1=(_l0lOl<=_l0ll1)and((_l0lI1<140)or(_l0lOl<70));local _l0lOO=(_l0llO<=(_l0l1O*0.5))and(_l0ll0<=(_l0l10*1.5));local _l0lO0=((_I0OOl or _I0OO1)or(_l0I1l:FindFirstChild(_D(371))~=nil))or(_l0I1O:FindFirstChild(_D(372))~=nil);local _l0l0I=((os.clock()>=_I0O11)and(_l0lIl==_I01IO.Name))and(not _l0lO0);if(((_l0l0I and(_l0lOI or _l0lO1))and(not _lI0lI(_l0I1l,_l0I1I)))and((os.clock()-_I0O1l)>=0.08))then _I0O1l=os.clock();_I0O11=os.clock()+_llIO1(_l0lI1);_I0O1O=math.min(_I0O1O+1,4);_I0O10=-1;_I0O0l();_ll1OI();_I00lI(_D(373));elseif(((_l0l0I and _l0lOO)and(_I0O1O<4))and((os.clock()-_I0O1l)>=0.08))then _I0O1l=os.clock();_I0O11=os.clock()+(_llIO1(_l0lI1)*0.6);_I0O1O=_I0O1O+1;_I0O10=-1;_I0O0l();_ll1OI();_I00lI(_D(374));elseif(_l0lIl==_I01IO.Name)then if _l0lO0 then _I00lI(_D(375));elseif((_l0llO<math.huge)and(_l0llO<=(_l0l1O+0.6)))then local _l0l0l=math.floor(_l0llO*10);if(_l0l0l~=_I0O10)then _I0O10=_l0l0l;_I00lI(string.format(_D(376),_l0l0l/10));end;elseif(_l0lOl<=(_l0ll1+14))then _I00lI(_D(377));else _I00lI(_D(378));end;else _I00lI(_D(379));end;else _I00lI(_D(380));end;else _I00lI((_I001I()and _D(381))or _D(382));end;end;if((os.clock()-_l0Il0)>=((_I010I and 0.34)or 0.2))then _l0Il0=os.clock();_lO00I(_l0I1l,_l0I1O,_l0I1I);end;end);end);end,function(_l0l01)_I0l11(_l0l01);end);
+        local cam0 = Workspace.CurrentCamera
+        if cam0 then
+                cam0:GetPropertyChangedSignal("ViewportSize"):Connect(applyFit)
+        end
+end)
+local function winScaleTo(target, time, style)
+        curWinScale = target
+        return TweenService:Create(winScale,
+                TweenInfo.new(time or 0.3, style or Enum.EasingStyle.Quint, Enum.EasingDirection.Out),
+                { Scale = fitFactor * target })
+end
+
+-- header (drag zone) + RS badge + liquid sweep
+local header = create("TextButton", {
+        Name = "Header", Size = UDim2.new(1, 0, 0, HEADER_H),
+        BackgroundTransparency = 1, Text = "", AutoButtonColor = false, Parent = main, ZIndex = 2,
+})
+local badgeScale = create("UIScale", { Scale = 0, Parent = header })
+local badge = create("TextLabel", {
+        Size = UDim2.fromOffset(34, 34), Position = UDim2.new(0, 12, 0.5, -17),
+        BackgroundColor3 = THEME.Red, Text = "RS",
+        Font = Enum.Font.GothamBlack, TextSize = 14,
+        TextColor3 = Color3.fromRGB(255, 255, 255), Parent = header, ZIndex = 3,
+})
+corner(badge, 9)
+stroke(badge, THEME.RedGlow, 1, 0.5)
+create("TextLabel", {
+        Size = UDim2.new(1, -120, 0, 17), Position = UDim2.new(0, 56, 0, 9),
+        BackgroundTransparency = 1, RichText = true,
+        Text = 'AUDI RS <font color="#FF2D46">//</font> BYAKUGAN',
+        Font = Enum.Font.GothamBlack, TextSize = 15,
+        TextColor3 = THEME.Text, TextXAlignment = Enum.TextXAlignment.Left,
+        Parent = header, ZIndex = 3,
+})
+create("TextLabel", {
+        Size = UDim2.new(1, -120, 0, 12), Position = UDim2.new(0, 56, 0, 27),
+        BackgroundTransparency = 1,
+        Text = "RS26.2 · HOOK REPLAY · PERF",
+        Font = Enum.Font.GothamBold, TextSize = 8,
+        TextColor3 = THEME.TextDim, TextXAlignment = Enum.TextXAlignment.Left,
+        Parent = header, ZIndex = 3,
+})
+
+-- liquid sheen that sweeps across the header every few seconds
+local sweep = create("Frame", {
+        Size = UDim2.new(0, 70, 1, 0), Position = UDim2.new(0, -90, 0, 0),
+        BackgroundColor3 = THEME.Glass, BackgroundTransparency = 0.86,
+        BorderSizePixel = 0, Parent = header, ZIndex = 2,
+})
+create("UIGradient", {
+        Rotation = 0,
+        Transparency = NumberSequence.new({
+                NumberSequenceKeypoint.new(0, 1),
+                NumberSequenceKeypoint.new(0.5, 0.35),
+                NumberSequenceKeypoint.new(1, 1),
+        }),
+        Parent = sweep,
+})
+task.spawn(function()
+        task.wait(2.5)
+        while uiAlive and sweep.Parent do
+                if perfMode then sweep.Visible = false task.wait(1)
+                else
+                sweep.Visible = true
+                sweep.Position = UDim2.new(0, -90, 0, 0)
+                local t = tw(sweep, 1.1, { Position = UDim2.new(1, 20, 0, 0) }, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut)
+                t:Play()
+                local done = false
+                t.Completed:Connect(function() done = true end)
+                while not done and uiAlive and sweep.Parent do task.wait(0.1) end
+                task.wait(6)
+                end
+        end
+end)
+
+local function ghostButton(symbol, xOffset)
+        local btn = create("TextButton", {
+                Size = UDim2.fromOffset(26, 26), Position = UDim2.new(1, xOffset, 0, 13),
+                BackgroundColor3 = THEME.Panel, Text = symbol,
+                Font = Enum.Font.GothamBold, TextSize = 13, TextColor3 = THEME.TextDim,
+                AutoButtonColor = false, Parent = header, ZIndex = 3,
+        })
+        corner(btn, 8)
+        stroke(btn, THEME.Stroke, 1, 0)
+        pressScale(btn, 0.82)
+        return btn
+end
+local minimizeBtn = ghostButton("–", -64)
+local closeBtn = ghostButton("×", -34)
+
+create("Frame", {
+        Size = UDim2.new(1, -24, 0, 1), Position = UDim2.new(0, 12, 0, 60),
+        BackgroundColor3 = THEME.Stroke, BackgroundTransparency = 0.4,
+        BorderSizePixel = 0, Parent = main,
+})
+
+-- status row (old RS HUD: STANDBY / PARRY ENGAGED)
+local statusDot = create("Frame", {
+        Size = UDim2.fromOffset(10, 10), Position = UDim2.new(0, 18, 0, 74),
+        BackgroundColor3 = THEME.TextDim, BorderSizePixel = 0, Parent = main,
+})
+fullCorner(statusDot)
+local statusText = create("TextLabel", {
+        Size = UDim2.new(0, 220, 0, 20), Position = UDim2.new(0, 36, 0, 69),
+        BackgroundTransparency = 1, Text = "STANDBY",
+        Font = Enum.Font.GothamBold, TextSize = 12,
+        TextColor3 = THEME.TextDim, TextXAlignment = Enum.TextXAlignment.Left,
+        Parent = main,
+})
+local statusScale = create("UIScale", { Scale = 1, Parent = statusText })
+local pulseTween = TweenService:Create(statusDot,
+        TweenInfo.new(0.6, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true),
+        { Size = UDim2.fromOffset(16, 16) })
+
+local function setStatus(active)
+        if active then
+                statusText.Text = "PARRY ENGAGED"
+                statusText.TextColor3 = THEME.RedGlow
+                statusDot.BackgroundColor3 = THEME.RedGlow
+                elasticPop(statusScale, 1.22)
+                if not pulseTween.Playing then pulseTween:Play() end
+        else
+                statusText.Text = "STANDBY"
+                statusText.TextColor3 = THEME.TextDim
+                statusDot.BackgroundColor3 = THEME.TextDim
+                pulseTween:Cancel()
+                statusDot.Size = UDim2.fromOffset(10, 10)
+        end
+end
+
+-- PERF MODE UI GATE — freezes every cosmetic infinite animation
+-- (rotating strokes, drifting wash, header sweep, dot pulse).
+-- These loops re-render every frame on mobile and were the main
+-- source of HUD lag.
+applyPerfUI = function()
+        local on = perfMode
+        if strokeGradTween then
+                if on then strokeGradTween:Pause() else strokeGradTween:Play() end
+        end
+        if ambientGradTween then
+                if on then ambientGradTween:Pause() else ambientGradTween:Play() end
+        end
+        if pulseTween then
+                if on then pulseTween:Pause()
+                elseif isRunning and not pulseTween.Playing then pulseTween:Play() end
+        end
+        if sweep and sweep.Parent then sweep.Visible = not on end
+end
+
+-- ============================================================
+-- [12] ROW BUILDERS — spring toggles + fluid steppers
+-- ============================================================
+local animRows = {} -- registered rows -> staggered cascade on open
+local rowY = 104 -- cursor shared with the wiring section
+local function rowSlot(h)
+        local y = rowY
+        rowY = rowY + h + 6
+        return y
+end
+
+local function makeSwitchRow(labelText, initial, callback)
+        local y = rowSlot(40)
+        local row = create("TextButton", {
+                Size = UDim2.new(1, -24, 0, 40), Position = UDim2.new(0, 12, 0, y),
+                BackgroundColor3 = THEME.PanelDark, Text = "",
+                AutoButtonColor = false, Parent = main, ZIndex = 2,
+        })
+        corner(row, 10)
+        local rowStroke = stroke(row, THEME.Stroke, 1, 0)
+        pressTint(row, row, 0.85)
+
+        create("TextLabel", {
+                Size = UDim2.new(1, -80, 1, 0), Position = UDim2.new(0, 12, 0, 0),
+                BackgroundTransparency = 1, Text = labelText,
+                Font = Enum.Font.GothamBold, TextSize = 13,
+                TextColor3 = THEME.Text, TextXAlignment = Enum.TextXAlignment.Left,
+                Parent = row, ZIndex = 3,
+        })
+
+        local track = create("Frame", {
+                AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -12, 0.5, 0),
+                Size = UDim2.fromOffset(42, 22),
+                BackgroundColor3 = initial and THEME.Red or THEME.Panel,
+                Parent = row, ZIndex = 3,
+        })
+        fullCorner(track)
+        local trackStroke = stroke(track, initial and THEME.RedGlow or THEME.Stroke, 1, 0)
+        local glowRing = stroke(track, THEME.RedGlow, 3, 1) -- flash ring on enable
+        local knobScale = create("UIScale", { Scale = 1, Parent = track })
+        local knob = create("Frame", {
+                AnchorPoint = Vector2.new(0.5, 0.5),
+                Size = UDim2.fromOffset(16, 16),
+                Position = UDim2.new(0, initial and 31 or 11, 0.5, 0),
+                BackgroundColor3 = initial and Color3.fromRGB(255, 255, 255) or THEME.TextDim,
+                Parent = track, ZIndex = 4,
+        })
+        fullCorner(knob)
+
+        local state = initial
+        local function render(instant)
+                local info = instant and TweenInfo.new(0)
+                        or TweenInfo.new(0.22, Enum.EasingStyle.Back, Enum.EasingDirection.Out)
+                TweenService:Create(knob, info, {
+                        Position = state and UDim2.new(0, 31, 0.5, 0) or UDim2.new(0, 11, 0.5, 0),
+                        BackgroundColor3 = state and Color3.fromRGB(255, 255, 255) or THEME.TextDim,
+                }):Play()
+                TweenService:Create(track, info, {
+                        BackgroundColor3 = state and THEME.Red or THEME.Panel,
+                }):Play()
+                TweenService:Create(trackStroke, info, {
+                        Color = state and THEME.RedGlow or THEME.Stroke,
+                }):Play()
+                TweenService:Create(rowStroke, info, {
+                        Color = state and THEME.Red or THEME.Stroke,
+                        Transparency = state and 0.1 or 0,
+                }):Play()
+        end
+        render(true)
+
+        row.Activated:Connect(function()
+                state = not state
+                render(false)
+                -- iOS squish: knob squeezes then springs back
+                if state then
+                        glowRing.Transparency = 0.1
+                        tw(glowRing, 0.5, { Transparency = 1 }, Enum.EasingStyle.Quad):Play()
+                end
+                elasticPop(knobScale, state and 1.28 or 1.16)
+                callback(state)
+        end)
+        table.insert(animRows, row)
+        return row
+end
+
+-- RS instrument-style stepper: "< VALUE >" with slide-bounce swap
+local function makeStepperRow(labelText, options, startIndex, onPick)
+        local y = rowSlot(36)
+        local row = create("TextButton", {
+                Size = UDim2.new(1, -24, 0, 36), Position = UDim2.new(0, 12, 0, y),
+                BackgroundColor3 = THEME.PanelDark, Text = "",
+                AutoButtonColor = false, Parent = main, ZIndex = 2,
+        })
+        corner(row, 10)
+        local rowStroke = stroke(row, THEME.Stroke, 1, 0)
+        pressTint(row, row, 0.85)
+        create("TextLabel", {
+                Size = UDim2.new(0, 110, 1, 0), Position = UDim2.new(0, 12, 0, 0),
+                BackgroundTransparency = 1, Text = labelText,
+                Font = Enum.Font.GothamBold, TextSize = 12,
+                TextColor3 = THEME.Text, TextXAlignment = Enum.TextXAlignment.Left,
+                Parent = row, ZIndex = 3,
+        })
+
+        local holder = create("Frame", {
+                AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -66, 0.5, 0),
+                Size = UDim2.new(0, 132, 0, 20), BackgroundTransparency = 1,
+                ClipsDescendants = true, Parent = row, ZIndex = 3,
+        })
+        local valueLabel = create("TextLabel", {
+                Size = UDim2.new(1, 0, 1, 0), Position = UDim2.new(0, 0, 0, 0),
+                BackgroundTransparency = 1, Text = options[startIndex],
+                Font = Enum.Font.GothamBlack, TextSize = 12,
+                TextColor3 = THEME.RedGlow, TextXAlignment = Enum.TextXAlignment.Right,
+                TextTruncate = Enum.TextTruncate.AtEnd, Parent = holder, ZIndex = 4,
+        })
+
+        local function arrow(xOffset, symbol)
+                local b = create("TextButton", {
+                        Size = UDim2.fromOffset(24, 24), Position = UDim2.new(1, xOffset, 0.5, -12),
+                        BackgroundColor3 = THEME.Panel, Text = symbol,
+                        Font = Enum.Font.GothamBlack, TextSize = 14, TextColor3 = THEME.TextDim,
+                        AutoButtonColor = false, Parent = row, ZIndex = 4,
+                })
+                corner(b, 7)
+                pressScale(b, 0.8)
+                return b
+        end
+        local leftBtn = arrow(-62, "<")
+        local rightBtn = arrow(-32, ">")
+
+        local idx = startIndex
+        local swapToken = 0
+        local function animateTo(newText, dir)
+                swapToken = swapToken + 1
+                local tk = swapToken
+                task.spawn(function()
+                        local out = tw(valueLabel, 0.1,
+                                { TextTransparency = 1, Position = UDim2.new(0, dir * -22, 0, 0) },
+                                Enum.EasingStyle.Quad, Enum.EasingDirection.In)
+                        out:Play()
+                        out.Completed:Wait()
+                        if tk ~= swapToken or not valueLabel.Parent then return end
+                        valueLabel.Text = newText
+                        valueLabel.Position = UDim2.new(0, dir * 22, 0, 0)
+                        tw(valueLabel, 0.32, { TextTransparency = 0, Position = UDim2.new(0, 0, 0, 0) },
+                                Enum.EasingStyle.Back):Play()
+                end)
+        end
+        local function flashArrow(btn)
+                btn.TextColor3 = THEME.RedGlow
+                tw(btn, 0.4, { TextColor3 = THEME.TextDim }, Enum.EasingStyle.Quad):Play()
+        end
+        local function bumpRow()
+                rowStroke.Color = THEME.Red
+                tw(rowStroke, 0.5, { Color = THEME.Stroke }, Enum.EasingStyle.Quad):Play()
+        end
+        local function step(dir)
+                idx = ((idx - 1 + dir) % #options) + 1
+                animateTo(options[idx], dir)
+                onPick(idx, options[idx])
+                bumpRow()
+        end
+        leftBtn.Activated:Connect(function() flashArrow(leftBtn) step(-1) end)
+        rightBtn.Activated:Connect(function() flashArrow(rightBtn) step(1) end)
+        row.Activated:Connect(function() step(1) end)
+        table.insert(animRows, row)
+        return row
+end
+
+-- ============================================================
+-- [13] DYNAMIC ISLAND — the pill + BYAKU-BOT ascii mascot
+-- ============================================================
+local pill = create("CanvasGroup", {
+        Name = "Island", AnchorPoint = Vector2.new(0.5, 0),
+        Position = UDim2.new(0.5, 0, 0, 12), Size = UDim2.fromOffset(118, 34),
+        BackgroundColor3 = Color3.fromRGB(8, 8, 10), BackgroundTransparency = 0.12,
+        BorderSizePixel = 0, ClipsDescendants = true, GroupTransparency = 1,
+        Visible = false, Parent = screenGui,
+})
+fullCorner(pill)
+stroke(pill, THEME.Glass, 1, 0.82)
+sheen(pill, 10, 17)
+local pillScale = create("UIScale", { Scale = 1, Parent = pill })
+
+-- BYAKU-BOT — tiny ascii robot living in the island. Blinks,
+-- smiles, and jumps up every now and then. Pure Text swaps, so
+-- it costs nothing even at 60 fps.
+local bot = create("TextLabel", {
+        AnchorPoint = Vector2.new(0, 0.5),
+        Size = UDim2.fromOffset(26, 16), Position = UDim2.new(0, 8, 0.5, -1),
+        BackgroundTransparency = 1, Text = "^_^",
+        Font = Enum.Font.Code, TextSize = 12,
+        TextColor3 = THEME.TextDim, TextXAlignment = Enum.TextXAlignment.Center,
+        Parent = pill,
+})
+local botScale = create("UIScale", { Scale = 1, Parent = bot })
+do
+        local BOT_IDLE, BOT_BLINK, BOT_JOY, BOT_JUMP = "^_^", "-_-", "^o^", "\\o/"
+        local lastBlink = os.clock()
+        local nextJump  = os.clock() + math.random(5, 10)
+        local jumping   = false
+        task.spawn(function()
+                while uiAlive do
+                        if not bot.Parent then break end
+                        local now = os.clock()
+                        if not jumping and now >= nextJump then
+                                jumping = true
+                                nextJump = now + math.random(7, 14)
+                                -- squash -> leap -> elastic land -> joy
+                                tw(botScale, 0.1, { Scale = 1.2 }, Enum.EasingStyle.Back):Play()
+                                bot.Text = BOT_IDLE
+                                task.wait(0.12)
+                                if not bot.Parent then break end
+                                bot.Text = BOT_JUMP
+                                tw(bot, 0.32, { Position = UDim2.new(0, 8, 0.5, -9) },
+                                        Enum.EasingStyle.Back, Enum.EasingDirection.Out):Play()
+                                task.wait(0.34)
+                                if not bot.Parent then break end
+                                tw(bot, 0.45, { Position = UDim2.new(0, 8, 0.5, -1) },
+                                        Enum.EasingStyle.Elastic, Enum.EasingDirection.Out):Play()
+                                task.wait(0.24)
+                                if not bot.Parent then break end
+                                bot.Text = BOT_JOY
+                                task.wait(0.55)
+                                if not bot.Parent then break end
+                                tw(botScale, 0.3, { Scale = 1 }, Enum.EasingStyle.Elastic):Play()
+                                bot.Text = BOT_IDLE
+                                jumping = false
+                        elseif not jumping and now - lastBlink >= 3.8 then
+                                lastBlink = now
+                                bot.Text = BOT_BLINK
+                                task.wait(0.14)
+                                if not bot.Parent then break end
+                                bot.Text = BOT_IDLE
+                        end
+                        task.wait(0.1)
+                end
+        end)
+end
+
+local pillLabel = create("TextLabel", {
+        Size = UDim2.new(1, -70, 1, 0), Position = UDim2.new(0, 36, 0, 0),
+        BackgroundTransparency = 1, Text = "Idle",
+        Font = Enum.Font.GothamBold, TextSize = 12,
+        TextColor3 = THEME.Text, TextXAlignment = Enum.TextXAlignment.Left, Parent = pill,
+})
+local pillDot = create("Frame", {
+        AnchorPoint = Vector2.new(1, 0.5), Size = UDim2.fromOffset(6, 6),
+        Position = UDim2.new(1, -10, 0.5, 0),
+        BackgroundColor3 = THEME.TextDim, BorderSizePixel = 0, Parent = pill,
+})
+fullCorner(pillDot)
+local pillButton = create("TextButton", {
+        Size = UDim2.new(1, 0, 1, 0), BackgroundTransparency = 1, Text = "", Parent = pill,
+})
+
+-- parry shockwave ring around the island
+local pillRing = create("Frame", {
+        AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0.5, 0, 0, 29),
+        Size = UDim2.fromOffset(34, 34), BackgroundTransparency = 1,
+        BorderSizePixel = 0, ZIndex = 4, Parent = screenGui,
+})
+fullCorner(pillRing)
+local pillRingStroke = stroke(pillRing, THEME.Glass, 2.5, 1)
+
+local popTween = nil
+local function islandPop(strength)
+        if not pillScale.Parent then return end
+        if popTween then popTween:Cancel() end
+        pillScale.Scale = strength
+        popTween = tw(pillScale, 0.6, { Scale = 1 }, Enum.EasingStyle.Elastic)
+        popTween:Play()
+end
+local wiggleToken = 0
+local function islandWiggle()
+        if perfMode then return end -- v26.2: no cosmetic churn in perf
+        if not pill.Parent then return end
+        wiggleToken = wiggleToken + 1
+        local token = wiggleToken
+        task.spawn(function()
+                for _, r in ipairs({ -3.5, 3, -2, 1, 0 }) do
+                        if token ~= wiggleToken or not pill.Parent then return end
+                        local t = tw(pill, 0.08, { Rotation = r }, Enum.EasingStyle.Quad)
+                        t:Play()
+                        t.Completed:Wait()
+                end
+        end)
+end
+
+-- THE SHOCKWAVE — v26.2: minimal WHITE pulse (red removed),
+-- skipped entirely in perf mode
+fxBurst = function()
+        if not fxEnabled or perfMode then return end
+        if fxGroup and fxGroup.Parent then
+                fxGroup.GroupTransparency = 0.55
+                tw(fxGroup, 0.26, { GroupTransparency = 1 }, Enum.EasingStyle.Quad, Enum.EasingDirection.Out):Play()
+        end
+        if pillRing and pillRing.Parent then
+                pillRing.Size = UDim2.fromOffset(34, 34)
+                pillRingStroke.Transparency = 0.3
+                tw(pillRing, 0.5, { Size = UDim2.fromOffset(120, 120) }, Enum.EasingStyle.Quint, Enum.EasingDirection.Out):Play()
+                tw(pillRingStroke, 0.5, { Transparency = 1 }, Enum.EasingStyle.Quint, Enum.EasingDirection.Out):Play()
+        end
+end
+
+-- ============================================================
+-- [14] OPEN / CLOSE / MINIMIZE — every move bounces
+-- ============================================================
+local winOpen = false
+local function openMain()
+        if winOpen then return end
+        winOpen = true
+        main.Visible = true
+        winScale.Scale = fitFactor * 0.7
+        main.GroupTransparency = 1
+        main.Rotation = -2.5
+        tw(main, 0.3, { GroupTransparency = 0 }):Play()
+        winScaleTo(1, 0.5, Enum.EasingStyle.Back):Play()
+        tw(main, 0.65, { Rotation = 0 }, Enum.EasingStyle.Elastic):Play()
+        elasticPop(badgeScale, 1.3) -- RS badge springs in on every open
+        islandPop(1.14)
+        islandWiggle()
+        -- v26.2: iOS list cascade — rows drift up with stagger
+        for i, r in ipairs(animRows) do
+                if r.Parent then
+                        local bp = r.Position
+                        r.Position = UDim2.new(bp.X.Scale, bp.X.Offset,
+                                bp.Y.Scale, bp.Y.Offset + 18)
+                        task.delay(i * 0.032, function()
+                                if r.Parent then
+                                        tw(r, 0.5, { Position = bp },
+                                                Enum.EasingStyle.Back, Enum.EasingDirection.Out):Play()
+                                end
+                        end)
+                end
+        end
+end
+local function closeMain()
+        if not winOpen then return end
+        winOpen = false
+        winScaleTo(0.8, 0.2):Play()
+        local out = tw(main, 0.2, { GroupTransparency = 1, Rotation = -1.5 },
+                Enum.EasingStyle.Quad, Enum.EasingDirection.In)
+        out:Play()
+        out.Completed:Connect(function()
+                if not winOpen and main.Parent then main.Visible = false end
+        end)
+end
+pillButton.Activated:Connect(function()
+        islandPop(1.12)
+        if winOpen then closeMain() else openMain() end
+end)
+minimizeBtn.Activated:Connect(function() closeMain() end)
+closeBtn.Activated:Connect(function()
+        if unloadFn then unloadFn() end
+end)
+
+-- dragging (mouse + touch) with fluid tilt settle
+do
+        local dragging = false
+        local dragStart = nil
+        local startPos = nil
+        header.InputBegan:Connect(function(input)
+                if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+                        dragging = true
+                        dragStart = input.Position
+                        startPos = main.Position
+                        input.Changed:Connect(function()
+                                if input.UserInputState == Enum.UserInputState.End then
+                                        dragging = false
+                                        if main.Parent then
+                                                tw(main, 0.6, { Rotation = 0 }, Enum.EasingStyle.Elastic):Play()
+                                        end
+                                end
+                        end)
+                end
+        end)
+        UserInputService.InputChanged:Connect(function(input)
+                if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+                        local delta = input.Position - dragStart
+                        main.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X,
+                                startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+                        if main.Parent then
+                                main.Rotation = math.clamp(delta.X * 0.03, -4, 4)
+                        end
+                end
+        end)
+        UserInputService.InputEnded:Connect(function(input)
+                if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+                        dragging = false
+                end
+        end)
+end
+
+-- ============================================================
+-- [15] BOOT CARD — RS ignition with springs
+-- ============================================================
+local bootCard = create("CanvasGroup", {
+        AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0.5, 0, 0.5, 0),
+        Size = UDim2.fromOffset(300, 190), BackgroundColor3 = THEME.Carbon,
+        BackgroundTransparency = 0.08, BorderSizePixel = 0, GroupTransparency = 1,
+        Visible = true, ZIndex = 50, Parent = screenGui,
+})
+corner(bootCard, 24)
+stroke(bootCard, THEME.RedGlow, 1.4, 0.5)
+sheen(bootCard, 20, 24)
+local bootScale = create("UIScale", { Scale = 0.7, Parent = bootCard })
+local bootBadgeScale = create("UIScale", { Scale = 0, Parent = bootCard })
+local bootBadge = create("TextLabel", {
+        Size = UDim2.fromOffset(46, 46), Position = UDim2.new(0.5, -23, 0, 18),
+        BackgroundColor3 = THEME.Red, Text = "RS",
+        Font = Enum.Font.GothamBlack, TextSize = 18,
+        TextColor3 = Color3.fromRGB(255, 255, 255), ZIndex = 51, Parent = bootCard,
+})
+corner(bootBadge, 12)
+stroke(bootBadge, THEME.RedGlow, 1.5, 0.35)
+local bootTitle = create("TextLabel", {
+        Size = UDim2.new(1, 0, 0, 26), Position = UDim2.new(0, 0, 0, 70),
+        BackgroundTransparency = 1, Text = "BYAKUGAN",
+        Font = Enum.Font.GothamBlack, TextSize = 22,
+        TextColor3 = THEME.Text, TextTransparency = 1, ZIndex = 51, Parent = bootCard,
+})
+local bootSub = create("TextLabel", {
+        Size = UDim2.new(1, 0, 0, 12), Position = UDim2.new(0, 0, 0, 96),
+        BackgroundTransparency = 1, Text = "AUDI RS × iOS 26 FLUID",
+        Font = Enum.Font.GothamBold, TextSize = 10,
+        TextColor3 = THEME.RedGlow, TextTransparency = 1, ZIndex = 51, Parent = bootCard,
+})
+local barBg = create("Frame", {
+        Size = UDim2.new(1, -48, 0, 6), Position = UDim2.new(0, 24, 0, 122),
+        BackgroundColor3 = Color3.fromRGB(40, 40, 46), BorderSizePixel = 0, ZIndex = 51, Parent = bootCard,
+})
+corner(barBg, 3)
+local barFill = create("Frame", {
+        Size = UDim2.new(0, 0, 1, 0), BackgroundColor3 = THEME.RedGlow,
+        BorderSizePixel = 0, ZIndex = 51, Parent = barBg,
+})
+corner(barFill, 3)
+local bootCaption = create("TextLabel", {
+        Size = UDim2.new(1, -24, 0, 12), Position = UDim2.new(0, 12, 0, 138),
+        BackgroundTransparency = 1, Text = "Igniting quattro core…",
+        Font = Enum.Font.GothamBold, TextSize = 10,
+        TextColor3 = THEME.TextDim, ZIndex = 51, Parent = bootCard,
+})
+local bootPct = create("TextLabel", {
+        Size = UDim2.new(1, 0, 0, 14), Position = UDim2.new(0, 0, 0, 156),
+        BackgroundTransparency = 1, Text = "0%",
+        Font = Enum.Font.GothamBlack, TextSize = 11,
+        TextColor3 = THEME.Text, ZIndex = 51, Parent = bootCard,
+})
+
+-- ============================================================
+-- [15b] HIGH PERFORMANCE MODE — strips the 3D fat, restorable
+-- ============================================================
+-- Client-side only: plastic-ify parts, kill decals/textures/
+-- particles/beams/trails/highlights/shadows, drop quality level,
+-- flatten terrain fx. Originals are snapshotted and restored on
+-- toggle-off. New descendants (round resets) are stripped too.
+local perfBackup = {}
+local perfConn   = nil
+local perfGlobals = {}
+local PERF_KEEP_MAT = { Neon = true, ForceField = true }
+
+local function perfStrip(inst)
+        if perfBackup[inst] then return end
+        if inst:IsA("Terrain") then return end -- Terrain inherits BasePart; never touch it
+        pcall(function()
+                if inst:IsA("BasePart") then
+                        perfBackup[inst] = {
+                                mat = inst.Material, shadow = inst.CastShadow,
+                                refl = inst.Reflectance,
+                        }
+                        if not PERF_KEEP_MAT[inst.Material] then
+                                inst.Material = Enum.Material.SmoothPlastic
+                        end
+                        inst.CastShadow = false
+                        inst.Reflectance = 0
+                elseif inst:IsA("Decal") or inst:IsA("Texture") then
+                        perfBackup[inst] = { tr = inst.Transparency }
+                        inst.Transparency = 1
+                elseif inst:IsA("ParticleEmitter") or inst:IsA("Fire")
+                        or inst:IsA("Smoke") or inst:IsA("Sparkles")
+                        or inst:IsA("Trail") or inst:IsA("Beam") then
+                        perfBackup[inst] = { en = inst.Enabled }
+                        inst.Enabled = false
+                elseif inst:IsA("Highlight") then
+                        perfBackup[inst] = { en = inst.Enabled }
+                        inst.Enabled = false
+                elseif inst:IsA("Explosion") then
+                        perfBackup[inst] = { vis = inst.Visible }
+                        inst.Visible = false
+                else
+                        return
+                end
+        end)
+end
+
+local function perfRestoreAll()
+        if perfConn then perfConn:Disconnect() perfConn = nil end
+        for inst, snap in pairs(perfBackup) do
+                pcall(function()
+                        if inst and inst.Parent then
+                                if snap.mat ~= nil then
+                                        inst.Material = snap.mat
+                                        inst.CastShadow = snap.shadow
+                                        inst.Reflectance = snap.refl
+                                end
+                                if snap.tr ~= nil then inst.Transparency = snap.tr end
+                                if snap.en ~= nil then inst.Enabled = snap.en end
+                                if snap.vis ~= nil then inst.Visible = snap.vis end
+                        end
+                end)
+                perfBackup[inst] = nil
+        end
+end
+
+local function perfApplyWorld(on)
+        local Lighting = game:GetService("Lighting")
+        if on then
+                perfGlobals = {}
+                pcall(function() perfGlobals.shadows = Lighting.GlobalShadows end)
+                pcall(function() perfGlobals.diff = Lighting.EnvironmentDiffuseScale end)
+                pcall(function() perfGlobals.spec = Lighting.EnvironmentSpecularScale end)
+                pcall(function()
+                        local terr = Workspace.Terrain
+                        perfGlobals.deco = terr.Decoration
+                        perfGlobals.wsize = terr.WaterWaveSize
+                        perfGlobals.wspeed = terr.WaterWaveSpeed
+                        perfGlobals.wrefl = terr.WaterReflectance
+                end)
+                pcall(function() Lighting.GlobalShadows = false end)
+                pcall(function() Lighting.EnvironmentDiffuseScale = 0 end)
+                pcall(function() Lighting.EnvironmentSpecularScale = 0 end)
+                pcall(function()
+                        local terr = Workspace.Terrain
+                        terr.Decoration = false
+                        terr.WaterWaveSize = 0
+                        terr.WaterWaveSpeed = 0
+                        terr.WaterReflectance = 0
+                end)
+                pcall(function()
+                        settings().Rendering.QualityLevel = Enum.QualityLevel.Level1
+                end)
+                for _, d in ipairs(Workspace:GetDescendants()) do perfStrip(d) end
+                perfConn = Workspace.DescendantAdded:Connect(function(d)
+                        task.defer(perfStrip, d)
+                end)
+        else
+                perfRestoreAll()
+                pcall(function() Lighting.GlobalShadows = perfGlobals.shadows end)
+                pcall(function() Lighting.EnvironmentDiffuseScale = perfGlobals.diff end)
+                pcall(function() Lighting.EnvironmentSpecularScale = perfGlobals.spec end)
+                pcall(function()
+                        local terr = Workspace.Terrain
+                        terr.Decoration = perfGlobals.deco
+                        terr.WaterWaveSize = perfGlobals.wsize
+                        terr.WaterWaveSpeed = perfGlobals.wspeed
+                        terr.WaterReflectance = perfGlobals.wrefl
+                end)
+                pcall(function()
+                        settings().Rendering.QualityLevel = Enum.QualityLevel.Automatic
+                end)
+        end
+end
+
+-- ============================================================
+-- [16] WIRE ROWS TO THE ENGINE
+-- ============================================================
+makeSwitchRow("AUTO PARRY", isRunning, function(v)
+        isRunning = v
+        setStatus(v)
+        pushStatus(v and "Parry on" or "Parry off", 1)
+end)
+
+makeSwitchRow("AUTO SPAM <15", autoSpamEnabled, function(v)
+        autoSpamEnabled = v
+        if not v then spamActive = false end
+        pushStatus(v and "Auto spam armed" or "Auto spam off", 1.2)
+end)
+
+makeSwitchRow("PARRY SHOCKWAVE", fxEnabled, function(v)
+        fxEnabled = v
+end)
+
+makeSwitchRow("BYAKUGAN AURA", auraEnabled, function(v)
+        auraEnabled = v
+        local char = LocalPlayer.Character
+        local hl = char and char:FindFirstChild("ByakuganAura")
+        if hl then hl.Enabled = v end
+end)
+
+makeSwitchRow("SERVER DOT", dotEnabled, function(v)
+        dotEnabled = v
+        serverBallDot.Transparency = v and 0 or 1
+end)
+
+makeSwitchRow("PERF MODE", perfMode, function(v)
+        perfMode = v
+        xpcall(function() perfApplyWorld(v) end, function() end)
+        if applyPerfUI then xpcall(function() applyPerfUI() end, function() end) end
+        pushStatus(v and "Perf mode ON" or "Perf mode off", 1.4)
+        if v then islandPop(1.1) end
+end)
+
+makeStepperRow("PARRY METHOD",
+        { "Auto (Smart)", "Hook Replay", "Button", "Firesignal", "Remote" }, 1,
+        function(i, opt)
+                parryMethod = ({ "Auto", "Hook", "Button", "Signal", "Remote" })[i]
+                pushStatus("Method: " .. opt, 1.2)
+        end)
+
+makeStepperRow("CURVE MODE",
+        { "Camera", "Random", "Accelerated", "Backwards", "Slow", "High", "Normal", "Speed", "Down", "Left", "Right" }, 1,
+        function(i, opt)
+                parryCurve = opt
+                pushStatus("Curve: " .. opt, 1.2)
+        end)
+
+-- ============================================================
+-- [17] LIVE STATS STRIP + DIAGNOSTICS + FOOTER
+-- ============================================================
+local statsY = rowY + 2
+rowY = statsY + 54 + 6
+local statsPanel = create("Frame", {
+        Size = UDim2.new(1, -24, 0, 54), Position = UDim2.new(0, 12, 0, statsY),
+        BackgroundColor3 = THEME.PanelDark, BorderSizePixel = 0, Parent = main,
+})
+corner(statsPanel, 10)
+stroke(statsPanel, THEME.Stroke, 1, 0)
+
+local function statColumn(index, caption)
+        local col = create("Frame", {
+                Size = UDim2.new(1 / 4, 0, 1, 0), Position = UDim2.new((index - 1) / 4, 0, 0, 0),
+                BackgroundTransparency = 1, Parent = statsPanel,
+        })
+        if index > 1 then
+                create("Frame", {
+                        Size = UDim2.new(0, 1, 1, -16), Position = UDim2.new(0, 0, 0, 8),
+                        BackgroundColor3 = THEME.Stroke, BorderSizePixel = 0, Parent = col,
+                })
+        end
+        local value = create("TextLabel", {
+                Size = UDim2.new(1, 0, 0, 22), Position = UDim2.new(0, 0, 0, 8),
+                BackgroundTransparency = 1, Text = "--",
+                Font = Enum.Font.GothamBlack, TextSize = 14,
+                TextColor3 = THEME.Text, Parent = col,
+        })
+        create("TextLabel", {
+                Size = UDim2.new(1, 0, 0, 12), Position = UDim2.new(0, 0, 0, 30),
+                BackgroundTransparency = 1, Text = caption,
+                Font = Enum.Font.GothamBold, TextSize = 8,
+                TextColor3 = THEME.TextDim, Parent = col,
+        })
+        return value
+end
+
+local pingVal   = statColumn(1, "PING")
+local speedVal  = statColumn(2, "BALL SPD")
+local radiusVal = statColumn(3, "RADIUS")
+local offsetVal = statColumn(4, "OFFSET")
+
+-- diagnostics caption (token + capture state at a glance)
+local diagCaption = create("TextLabel", {
+        Size = UDim2.new(1, -24, 0, 14), Position = UDim2.new(0, 12, 0, rowY),
+        BackgroundTransparency = 1, Text = "PRY SCANNING · CAPTURE TAP BLOCK ONCE",
+        Font = Enum.Font.GothamBold, TextSize = 9, TextColor3 = THEME.Amber,
+        TextXAlignment = Enum.TextXAlignment.Left, Parent = main,
+})
+rowY = rowY + 20
+
+-- diagnostic actions
+local btnRowY = rowSlot(32)
+local function diagButton(label, half, cb)
+        local b = create("TextButton", {
+                Size = UDim2.new(0.5, -16, 0, 32),
+                Position = UDim2.new(half, half == 0 and 12 or 4, 0, btnRowY),
+                BackgroundColor3 = THEME.Panel, Text = label,
+                Font = Enum.Font.GothamBold, TextSize = 10, TextColor3 = THEME.Text,
+                AutoButtonColor = false, Parent = main,
+        })
+        corner(b, 9)
+        stroke(b, THEME.Stroke, 1, 0)
+        pressScale(b, 0.9)
+        b.Activated:Connect(function()
+                b.TextColor3 = THEME.RedGlow
+                tw(b, 0.5, { TextColor3 = THEME.Text }, Enum.EasingStyle.Quad):Play()
+                cb()
+        end)
+        return b
+end
+diagButton("RESCAN TOKEN", 0, function()
+        local ok = findTokenFunction()
+        pushStatus(ok and "Token found" or "Token missing", 1.4)
+        if ok then islandPop(1.1) end
+end)
+diagButton("RE-ARM HOOK", 0.5, function()
+        hookState.captured = nil
+        hookState.capturedArgs = nil
+        hookState.announced = false
+        for k in pairs(hookStored) do hookStored[k] = nil end
+        pushStatus("Capture reset", 1.4)
+end)
+
+-- footer
+local footerY = rowY + 8
+create("Frame", {
+        Size = UDim2.new(1, -24, 0, 1), Position = UDim2.new(0, 12, 0, footerY - 5),
+        BackgroundColor3 = THEME.Stroke, BackgroundTransparency = 0.5,
+        BorderSizePixel = 0, Parent = main,
+})
+create("TextLabel", {
+        Size = UDim2.new(0, 190, 0, 18), Position = UDim2.new(0, 14, 0, footerY),
+        BackgroundTransparency = 1, Text = "QUATTRO LOGIC • RS26 FLUID",
+        Font = Enum.Font.GothamBold, TextSize = 9,
+        TextColor3 = THEME.TextDim, TextTransparency = 0.3,
+        TextXAlignment = Enum.TextXAlignment.Left, Parent = main,
+})
+local firesLabel = create("TextLabel", {
+        Size = UDim2.new(0, 90, 0, 18), Position = UDim2.new(1, -14, 0, footerY),
+        BackgroundTransparency = 1, Text = "fires 0",
+        Font = Enum.Font.GothamBold, TextSize = 9,
+        TextColor3 = THEME.TextDim, TextXAlignment = Enum.TextXAlignment.Right, Parent = main,
+})
+
+-- final window height -> re-fit to screen
+winH = footerY + 30
+main.Size = UDim2.fromOffset(WIN_W, winH)
+applyFit()
+
+-- full unload (old RS HUD close behavior)
+unloadFn = function()
+        isRunning = false
+        uiAlive = false
+        spamActive = false
+        if renderConn then
+                renderConn:Disconnect()
+                renderConn = nil
+        end
+        for _, c in ipairs(liveConns) do
+                pcall(function() c:Disconnect() end)
+        end
+        liveConns = {}
+        -- restore the world if perf mode was stripping it
+        if perfMode then
+                perfMode = false
+                xpcall(function() perfApplyWorld(false) end, function() end)
+        end
+        pcall(function() screenGui:Destroy() end)
+        pcall(function() serverBallDot:Destroy() end)
+        local char = LocalPlayer.Character
+        local hl = char and char:FindFirstChild("ByakuganAura")
+        if hl then hl:Destroy() end
+end
+
+-- ============================================================
+-- [18] BOOT SEQUENCE — springs all the way in
+-- ============================================================
+local bootSettled = false -- v26.5: boot failsafe flag (watchdog below)
+bootSay("[BYAK 5/6] boot animation…")
+task.spawn(function()
+        pcall(function()
+                tw(bootCard, 0.4, { GroupTransparency = 0 }):Play()
+                tw(bootScale, 0.6, { Scale = 1 }, Enum.EasingStyle.Back):Play()
+                task.wait(0.18)
+                tw(bootBadgeScale, 0.7, { Scale = 1 }, Enum.EasingStyle.Elastic):Play()
+                bootTitle.Position = UDim2.new(0, 0, 0, 78)
+                tw(bootTitle, 0.45, { TextTransparency = 0, Position = UDim2.new(0, 0, 0, 70) }):Play()
+                tw(bootSub, 0.55, { TextTransparency = 0 }):Play()
+                task.wait(0.3)
+                local captions = {
+                        { 0.0,  "Igniting quattro core…" },
+                        { 0.22, "Scanning GC for the PRY token…" },
+                        { 0.48, "Hooking remotes for capture…" },
+                        { 0.72, "Syncing player + client ping…" },
+                        { 0.92, "Byakugan online." },
+                }
+                local progress, lastCap = 0, captions[1][2]
+                while progress < 1 do
+                        progress = math.min(1, progress + math.random(22, 60) / 1000)
+                        local cap = captions[1][2]
+                        for _, c in ipairs(captions) do
+                                if progress >= c[1] then cap = c[2] end
+                        end
+                        if cap ~= lastCap then
+                                lastCap = cap
+                                bootCaption.Text = cap
+                        end
+                        bootPct.Text = tostring(math.floor(progress * 100)) .. "%"
+                        tw(barFill, 0.3, { Size = UDim2.new(progress, 0, 1, 0) }, Enum.EasingStyle.Quart):Play()
+                        task.wait(math.random(8, 18) / 100)
+                end
+                bootPct.Text = "100%"
+                bootCaption.Text = "Ready — engage."
+                findTokenFunction()
+                task.wait(0.45)
+                local out = tw(bootCard, 0.26, { GroupTransparency = 1 }, Enum.EasingStyle.Quint, Enum.EasingDirection.In)
+                tw(bootScale, 0.3, { Scale = 1.06 }, Enum.EasingStyle.Back, Enum.EasingDirection.In):Play()
+                task.wait(0.12)
+                tw(bootScale, 0.2, { Scale = 0.85 }, Enum.EasingStyle.Quint, Enum.EasingDirection.In):Play()
+                out:Play()
+                out.Completed:Wait()
+                pcall(function() bootCard:Destroy() end)
+        end)
+        -- v26.5: the post-animation tail is pcall'd — a nil pill or an
+        -- island hiccup can no longer kill the "online" stage and leave
+        -- the boot card / tracer stuck forever
+        pcall(function()
+                pill.Visible = true
+                pill.GroupTransparency = 1
+                tw(pill, 0.3, { GroupTransparency = 0 }):Play()
+        end)
+        bootSettled = true
+        bootSay("[BYAK ✓] online — tracer clears in 30 s")
+        pcall(function()
+                islandPop(1.2)
+                islandWiggle()
+                pushStatus("Aura ignited", 2)
+                if hookState.tokenOk then
+                        pushStatus("PRY token found", 2.2)
+                elseif not hookSupported then
+                        pushStatus("No getgc — hook off", 2.4)
+                end
+                openMain()
+        end)
+end)
+
+-- ============================================================
+-- [18b] BOOT FAILSAFE (v26.5) — the boot can no longer stick. If the
+--      animation thread died mid-way, 9 s after boot start the card
+--      is force-destroyed and the HUD + main panel are force-opened.
+--      No-op when boot settled normally.
+-- ============================================================
+task.delay(9, function()
+        if bootSettled then return end
+        bootSay("[BYAK ·] boot failsafe — forcing HUD online", true)
+        pcall(function()
+                if bootCard and bootCard.Parent then bootCard:Destroy() end
+        end)
+        pcall(function()
+                if pill and not pill.Visible then
+                        pill.Visible = true
+                        pill.GroupTransparency = 1
+                        tw(pill, 0.3, { GroupTransparency = 0 }):Play()
+                end
+        end)
+        pcall(function() openMain() end)
+        bootSettled = true
+end)
+
+-- ============================================================
+-- [19] HUD REFRESH
+-- ============================================================
+local STATUS_COLORS = {
+        ["Idle"]          = THEME.TextDim,
+        ["Paused"]        = THEME.TextDim,
+        ["Tracking"]      = THEME.TextDim,
+        ["Not you"]       = THEME.TextDim,
+        ["Waiting"]       = THEME.Amber,
+        ["No ball"]       = THEME.Amber,
+        ["No zoomies"]    = THEME.Amber,
+        ["Getting close"] = THEME.Amber,
+        ["Parried"]       = THEME.Good,
+        ["Parrying"]      = THEME.RedGlow,
+        ["Hook fired"]    = THEME.Text,
+        ["Hook armed"]    = THEME.Good,
+        ["Aura ignited"]  = THEME.Good,
+        ["SPAM ENGAGED"]  = THEME.RedGlow,
+        ["Spam released"] = THEME.TextDim,
+        ["Parry on"]      = THEME.Good,
+        ["Parry off"]     = THEME.TextDim,
+}
+local lastIslandText = nil
+-- v26.2 anti-lag: HUD writes are cached — a label is only touched
+-- when its value actually changed (every Roblox Text write forces
+-- a re-layout; writing 6 labels at 8 Hz for nothing = mobile lag)
+local hudTextCache, hudColCache = {}, {}
+local function hudSet(label, key, text)
+        if not label.Parent then return end
+        if hudTextCache[key] ~= text then
+                hudTextCache[key] = text
+                label.Text = text
+        end
+end
+local function hudCol(label, key, color)
+        if not label.Parent then return end
+        if hudColCache[key] ~= color then
+                hudColCache[key] = color
+                label.TextColor3 = color
+        end
+end
+local function updateHUD(ball, root, pingSec)
+        local txt = resolvedStatus()
+        local col = STATUS_COLORS[txt] or THEME.Text
+        if pillLabel.Parent then
+                if txt ~= lastIslandText then
+                        lastIslandText = txt
+                        pillLabel.Text = txt
+                        pillDot.BackgroundColor3 = col
+                        pillLabel.TextColor3 = txt == "Idle" and THEME.TextDim or THEME.Text
+                        if txt ~= "Idle" and txt ~= "Tracking" and txt ~= "Not you" then
+                                islandPop(1.08)
+                        end
+                end
+        end
+        local ptxt = "--"
+        local pcol = THEME.TextDim
+        if dataPingMs and dataPingMs > 0 then
+                ptxt = tostring(math.floor(dataPingMs)) .. "ms"
+                if dataPingMs < 80 then pcol = THEME.Good
+                elseif dataPingMs < 160 then pcol = THEME.Amber
+                else pcol = THEME.Bad end
+        end
+        hudSet(pingVal, "ping", ptxt)
+        hudCol(pingVal, "ping", pcol)
+        if ball and root then
+                local vel = ballVelocity(ball)
+                local speed = vel.Magnitude
+                hudSet(speedVal, "speed", tostring(math.floor(speed)))
+                hudSet(radiusVal, "radius", tostring(math.floor(parryAccuracy(speed, pingSec))))
+        else
+                hudSet(speedVal, "speed", "--")
+                hudSet(radiusVal, "radius", "--")
+        end
+        if offsetVal.Parent then
+                local offsetMs = math.floor(getParryTimeOffset() * 1000)
+                hudSet(offsetVal, "offset", tostring(offsetMs) .. "ms")
+                local ocol = offsetMs > 250 and THEME.Bad
+                        or (offsetMs > 120 and THEME.Amber or THEME.Text)
+                hudCol(offsetVal, "offset", ocol)
+        end
+        if firesLabel.Parent then
+                hudSet(firesLabel, "fires", "fires " .. tostring(totalFires))
+        end
+        if diagCaption.Parent then
+                local tokTxt = hookState.tokenOk and "FOUND" or (hookSupported and "SCANNING" or "NO GETGC")
+                local capTxt = (hookState.captured ~= nil) and "ARMED" or "TAP BLOCK ONCE"
+                hudSet(diagCaption, "diag", "PRY " .. tokTxt .. " · CAPTURE " .. capTxt)
+                hudCol(diagCaption, "diag",
+                        (hookState.tokenOk and hookState.captured ~= nil) and THEME.Good or THEME.Amber)
+        end
+end
+
+-- ============================================================
+-- [20] CORE LOOP — server-ball offset parry + 15-stud auto spam
+-- ============================================================
+local lastHud = 0
+renderConn = RunService.RenderStepped:Connect(function()
+        pcall(function()
+                frameCount = frameCount + 1
+                local pingSec = getPingMs() / 1000
+                local ball = getActiveBall()
+                local char = LocalPlayer.Character
+                local root = char and char:FindFirstChild("HumanoidRootPart")
+                -- per-frame ball physics, computed ONCE (serverBallPos
+                -- tracks acceleration — it must run a single time/frame)
+                local framePhys = nil
+
+                -- yellow dot = SERVER-side ball, extrapolated by the
+                -- parry time offset: 2 x (playerPing + clientPing + machineDelay)
+                -- (v26.1: second-order — follows curved flight)
+                if ball and root then
+                        local zoomies = ball:FindFirstChild("zoomies")
+                        if zoomies then
+                                local vel = zoomies.VectorVelocity
+                                local offset = getParryTimeOffset()
+                                local sp = serverBallPos(ball, zoomies, offset)
+                                framePhys = {
+                                        vel = vel, speed = vel.Magnitude,
+                                        serverPos = sp, offset = offset,
+                                }
+                                serverBallDot.Position = sp
+                        else
+                                serverBallDot.Position = ball.Position
+                                        + ballVelocity(ball) * getParryTimeOffset()
+                        end
+                        if auraEnabled and not char:FindFirstChild("ByakuganAura") then setupAura() end
+                else
+                        serverBallDot.Position = Vector3.new(0, -100, 0)
+                end
+
+                -- ===== AUTO SPAM (v26.3 — survival-gated) =====
+                -- Spam engages ONLY when the ball is actually coming TO US
+                -- (target == me) and is within 15 studs. Fires are capped
+                -- per engagement and throttled — an infinite 66/s spam on
+                -- a passing/hovering ball was redirecting it into us and
+                -- getting us killed.
+                if autoSpamEnabled and ball
+                        and not deathActive and not infActive then
+                        local spamTarget = ball:GetAttribute("target")
+                        local _, tRoot = ballTargetPlayer(ball)
+                        local comingToMe = spamTarget == LocalPlayer.Name
+                                and tRoot ~= nil
+                        local protected = root ~= nil
+                                and (root:FindFirstChild("SingularityCape") ~= nil
+                                        or ball:FindFirstChild("ComboCounter") ~= nil)
+                        if comingToMe then
+                                local targetDist = (tRoot.Position - ball.Position).Magnitude
+                                if not spamActive
+                                        and os.clock() >= spamCooldownUntil
+                                        and targetDist <= 15 and not protected then
+                                        spamActive = true
+                                        spamFires = 0
+                                        pushStatus("SPAM ENGAGED", 1.4)
+                                        islandPop(1.25)
+                                        fxBurst()
+                                elseif spamActive
+                                        and (targetDist > 22 or protected) then
+                                        spamActive = false
+                                        spamCooldownUntil = os.clock() + 0.6
+                                        pushStatus("Spam released", 0.8)
+                                end
+                        elseif spamActive then
+                                -- ball went to someone else -> stop instantly
+                                spamActive = false
+                                spamCooldownUntil = os.clock() + 0.6
+                        end
+                elseif spamActive then
+                        spamActive = false
+                        spamCooldownUntil = os.clock() + 0.6
+                end
+                -- fires: 0.09 s throttle + hard cap 14 per engagement
+                if spamActive and spamFires < 14
+                        and os.clock() - lastSpamAt >= 0.09
+                        and os.clock() - lastAutoFireAt >= 0.09 then
+                        lastSpamAt = os.clock()
+                        lastAutoFireAt = os.clock()
+                        if fireParryRemote(getCurveCFrame()) then
+                                spamFireCount = spamFireCount + 1
+                                spamFires = spamFires + 1
+                                if spamFires >= 14 then
+                                        spamActive = false
+                                        spamCooldownUntil = os.clock() + 1
+                                end
+                        end
+                end
+
+                -- ===== AUTO PARRY (TTI interception + server-ball offset) =====
+                if isRunning then
+                        if ball and root then
+                                local zoomies = ball:FindFirstChild("zoomies")
+                                if zoomies then
+                                        local target = ball:GetAttribute("target")
+                                        -- v26.3: reset parry state ONLY on a real
+                                        -- target change — nil-flicker must not
+                                        -- re-arm the parry (burst-fire bug)
+                                        if target ~= nil
+                                                and lastTargetOf[ball] ~= target then
+                                                lastTargetOf[ball] = target
+                                                parriedUntil = 0
+                                                parryRetries = 0
+                                                lastTtiBucket = -1
+                                        end
+                                        local speed, serverPos
+                                        if framePhys then
+                                                speed = framePhys.speed
+                                                serverPos = framePhys.serverPos
+                                        else
+                                                speed = zoomies.VectorVelocity.Magnitude
+                                                serverPos = ball.Position
+                                                        + zoomies.VectorVelocity * getParryTimeOffset()
+                                        end
+                                        local vel = framePhys and framePhys.vel
+                                                or zoomies.VectorVelocity
+                                        local distServer = (serverPos - root.Position).Magnitude
+                                        local distReal = (root.Position - ball.Position).Magnitude
+                                        local accuracy = parryAccuracy(speed, pingSec)
+
+                                        -- PATH / TTI MATH — closest point of the ball's
+                                        -- flight path to us. v26.4: measured from the REAL
+                                        -- ball, NOT the offset-extrapolated phantom. The
+                                        -- phantom sat up to ~200 studs ahead of reality,
+                                        -- so tti read `offset` seconds small and the fire
+                                        -- window added the same offset AGAIN — cross-map
+                                        -- spam + early parries. Distance-independent:
+                                        -- a 700 stud/s ball from 500 studs still triggers
+                                        -- on TIME, not on a radius it crosses in a frame.
+                                        local tti, lateral = math.huge, math.huge
+                                        if speed > 1 then
+                                                local dir = vel.Unit
+                                                local rel = root.Position - ball.Position
+                                                local along = rel:Dot(dir)
+                                                if along > 0 then
+                                                        tti = along / speed
+                                                        lateral = (rel - dir * along).Magnitude
+                                                end
+                                        end
+                                        local fireTti = ttiFireWindow(speed)
+                                        local hitRadius = math.max(accuracy * 0.55, 12)
+                                        local ttiHit = tti <= fireTti and lateral <= hitRadius
+                                        -- proximity fallback — v26.4: REAL distance only.
+                                        -- distServer is the ball pushed `offset` seconds
+                                        -- into its own future; using it here let a 250-stud
+                                        -- ball read as "10 studs" and fire across the map.
+                                        local nearDist = distReal
+                                        local proxHit = nearDist <= accuracy
+                                                and (speed < 140 or nearDist < 70)
+                                        -- PANIC: contact in the last ~half of the send
+                                        -- lead (~0.13 s) — curve veto ignored
+                                        -- (v26.3: lateral tightened — panicking at balls
+                                        -- passing far to the side was a kill-risk)
+                                        local panic = tti <= fireTti * 0.5
+                                                and lateral <= hitRadius * 1.5
+                                        local blocked = deathActive or infActive
+                                                or ball:FindFirstChild("ComboCounter") ~= nil
+                                                or root:FindFirstChild("SingularityCape") ~= nil
+                                        local armed = os.clock() >= parriedUntil
+                                                and target == LocalPlayer.Name
+                                                and not blocked
+
+                                        if armed and (ttiHit or proxHit)
+                                                and not isCurved(ball, pingSec)
+                                                and os.clock() - lastAutoFireAt >= 0.08 then
+                                                lastAutoFireAt = os.clock()
+                                                parriedUntil = os.clock() + parryCooldown(speed)
+                                                parryRetries = math.min(parryRetries + 1, 4)
+                                                lastTtiBucket = -1
+                                                fxBurst()
+                                                fireSelected()
+                                                setBaseStatus("TTI PARRY")
+                                        elseif armed and panic and parryRetries < 4
+                                                and os.clock() - lastAutoFireAt >= 0.08 then
+                                                -- last-resort refire: contact imminent, the
+                                                -- curve veto no longer outranks survival
+                                                lastAutoFireAt = os.clock()
+                                                parriedUntil = os.clock()
+                                                        + parryCooldown(speed) * 0.6
+                                                parryRetries = parryRetries + 1
+                                                lastTtiBucket = -1
+                                                fxBurst()
+                                                fireSelected()
+                                                setBaseStatus("PANIC PARRY")
+                                        elseif target == LocalPlayer.Name then
+                                                if blocked then
+                                                        setBaseStatus("PROTECTED")
+                                                elseif tti < math.huge and tti <= fireTti + 0.6 then
+                                                        -- quantized to 0.1 s steps: no string
+                                                        -- garbage every frame (mobile GC lag)
+                                                        local bucket = math.floor(tti * 10)
+                                                        if bucket ~= lastTtiBucket then
+                                                                lastTtiBucket = bucket
+                                                                setBaseStatus(string.format("TTI %.1f", bucket / 10))
+                                                        end
+                                                elseif nearDist <= accuracy + 14 then
+                                                        setBaseStatus("Getting close")
+                                                else
+                                                        setBaseStatus("Tracking")
+                                                end
+                                        else
+                                                setBaseStatus("Not you")
+                                        end
+                                else
+                                        setBaseStatus("No zoomies")
+                                end
+                        else
+                                setBaseStatus(getBalls() and "Waiting" or "No ball")
+                        end
+                end
+
+                if os.clock() - lastHud >= (perfMode and 0.34 or 0.2) then
+                        lastHud = os.clock()
+                        updateHUD(ball, root, pingSec)
+                end
+        end)
+end)
+
+end, function(err)
+        byakFatal(err)
+end)
