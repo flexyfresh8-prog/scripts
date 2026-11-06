@@ -1,9 +1,30 @@
-# Blade Ball — BYAKUGAN RS26.9 (Audi RS × iOS 26 Fluid)
+# Blade Ball — BYAKUGAN RS27 (Audi RS × iOS 26 Fluid)
 
 Mobile auto-parry for **Roblox Blade Ball**, built for **Delta iOS**.
 The original **RS HUD** is back — Tango Red / Carbon Audi look — rebuilt with
 iOS 26 liquid-glass motion: spring bounces, elastic pops, fluid steppers,
 parry shockwaves, a Dynamic Island and an animated boot sequence.
+
+**v27.0 — NEURA NETWORK (new) + SPAM "even faster":**
+- a real **8 → 6 → 1 neural network** (tanh MLP) trains **live on your own
+  device** — inputs are the ball's position vs **your hitbox position** every
+  frame (along-track time, lateral miss, real distance, vertical offset) plus
+  ball speed, curve rate, ping and PREDICT level; the output is a **±0.12 s
+  timing bias added to the fire window**
+- training is supervised by what the **server did**: the moment the ball's
+  velocity flips (> 72° in one frame — a curve bends < 5°/frame) the
+  redirect has landed = your parry was accepted. Label =
+  `fire − resolve + 2 × ping`, one SGD step per approach — **late parries
+  widen the window, early parries narrow it**, so the timing converges on
+  YOUR ping + device latency after ~10–20 approaches
+- **zero at boot** (exact v26.9 behavior until the first sample) and spam
+  shots are never trained on; hover balls (< 20 stud/s) and balls that never
+  arrive are discarded
+- **NEURA stepper**: `ON · OFF` (default ON; OFF = exact v26.9 timing).
+  Re-executing resets the net — it re-learns in the first minutes of play
+- spam retune: fire rate **0.04 → 0.02 s (~50 packets/s)**, engagement cap
+  **20 → 30** (same 0.6 s envelope, double the density); ≤ 10 stud engage /
+  14 release / hover-ball cooldowns unchanged
 
 **v26.9 — SPAM OVERHAUL (tuned):**
 - **proximity-only engage**: the ball within **10 studs of you**, regardless of
@@ -171,6 +192,21 @@ The offset extrapolates the **server-side ball position** (second-order:
 per-frame acceleration tracking follows curved flight). The yellow dot shows
 the extrapolated server ball in real time.
 
+### v27.0 — NEURA timing bias (optional, ON by default)
+
+```
+fireWindow = ttiFireWindow(speed) + neuraBias          (v27.0)
+neuraBias  = 0.12 × tanh( MLP( ball-vs-hitbox geometry ) )   ±0.12 s
+trained on: label = fire − resolve + 2 × ping   (one SGD step / approach)
+resolve    = velocity flip (> 72°/frame) = redirect landed,
+             else closest approach within 15 studs
+```
+
+- output is **exactly 0** until the first resolved approach — boot behavior
+  identical to v26.9
+- the bias shifts the whole window (TTI branch + PANIC threshold), which is
+  the point: it is a learned correction of YOUR end-to-end latency
+
 ### v26.1 — time-to-impact interception (long range, high speed)
 
 ```
@@ -209,20 +245,21 @@ fireWindow unchanged — predict adds lead on the MEASUREMENT side only,
 ## Auto spam
 
 ```
-distance(ball → you) ≤ 10 studs  →  spam ENGAGES (hook replays, 0.04 s apart)
+distance(ball → you) ≤ 10 studs  →  spam ENGAGES (hook replays, 0.02 s apart)
 distance(ball → you) > 14 studs  →  spam releases (hysteresis)
 ```
 
 Pure proximity — targeting is ignored entirely (a flickering target
 attribute used to leave close balls unspammed). Toggle `AUTO SPAM <10` on
-the HUD (ON by default). Cap 20 fires per engagement, then a 1 s cooldown.
+the HUD (ON by default). Cap 30 fires per engagement at ~50/s, then a 1 s
+cooldown.
 
 ## HUD controls
 
 | Control | What it does |
 | --- | --- |
 | AUTO PARRY | Master switch (ON at boot) |
-| AUTO SPAM <10 | 10-stud auto spam engagement (proximity-only, ~25 fires/s) |
+| AUTO SPAM <10 | 10-stud auto spam engagement (proximity-only, ~50 fires/s) |
 | PARRY SHOCKWAVE | Screen-edge glow + island ring on every parry |
 | BYAKUGAN AURA | Red character highlight |
 | SERVER DOT | Yellow server-ball prediction dot |
@@ -230,6 +267,7 @@ the HUD (ON by default). Cap 20 fires per engagement, then a 1 s cooldown.
 | CURVE MODE | `Camera · Random · Accelerated · Backwards · Slow · High · Normal · Speed · Down · Left · Right` |
 | PREDICT | Future-ball lead: `OFF · 25% · 50% · 75% · 100%` of the parry offset (default OFF) |
 | ROTATION | Rotation-curve prediction from the steering player's yaw rate (default ON; needs PREDICT to act) |
+| NEURA | Self-learning timing net: watches ball vs your hitbox and shifts the fire window ±0.12 s to your latency (default ON) |
 
 Stats strip: **PING · BALL SPD · RADIUS · OFFSET** (live parry time offset).
 Diagnostics: `RESCAN TOKEN` / `RE-ARM HOOK` buttons + token/capture caption.
@@ -250,3 +288,5 @@ Close (`×`) unloads the script completely.
 | Parries too early with PREDICT on | PREDICT adds extra lead on top of the v26.4 window by design — step it down (50% → 25%) or set OFF; OFF is the v26.5 timing exactly |
 | Curved balls still parry late (PANIC only) | Turn PREDICT on (25–50%) and keep ROTATION ON — the steerer's yaw rate leads the curve so TTI can fire during the bend. If a friend's curves predict the wrong side, flip ROTATION OFF and report it — the turn-side gain is tunable |
 | Double parries, then dies on cooldown | Fixed in v26.7 — the second packet fired while the redirect was still replicating and wasted the parry cooldown before contact. TTI now fires once per approach and PANIC waits out `2 × ping + 0.06` first; the lockout ping is `max(Data Ping, GetNetworkPing)` so it can't collapse to 0 |
+| Parry timing got worse after NEURA learned | Give it 10–20 approaches to converge (watch it settle); if a weird session poisoned it, re-execute the script — the net resets and re-learns. `NEURA OFF` = exact v26.9 timing |
+| Spam drains too fast / too slow | Engagement is 30 fires @ ~50/s (0.6 s envelope) with a 1 s post-cap cooldown — tuned so the saturation window covers `2 × ping + 0.06`; ask for a retune with your ping if it still misses |
