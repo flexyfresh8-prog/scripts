@@ -1,9 +1,30 @@
-# Blade Ball — BYAKUGAN RS26.2 (Audi RS × iOS 26 Fluid)
+# Blade Ball — BYAKUGAN RS26.4 (Audi RS × iOS 26 Fluid)
 
 Mobile auto-parry for **Roblox Blade Ball**, built for **Delta iOS**.
 The original **RS HUD** is back — Tango Red / Carbon Audi look — rebuilt with
 iOS 26 liquid-glass motion: spring bounces, elastic pops, fluid steppers,
 parry shockwaves, a Dynamic Island and an animated boot sequence.
+
+**v26.4 — TIMING FIX (cross-map spam + early parries):**
+- the trigger measured the **phantom ball** (position already pushed `offset`
+  seconds into the future, up to ~200 studs ahead at speed) and the fire
+  window added the **same offset again** — the lead was double-counted. A
+  ball half a map away read as "10 studs" and `tti` read ~1 s small
+- **TTI / lateral / proximity now measure the REAL ball position** — no more
+  firing when you are on the other side of the map, no more parrying a ball
+  that is still 300 studs out
+- **fire window = the pure send lead** `1 × (pings + machineDelay)`
+  (half the offset formula — its other half used to hide inside the phantom
+  subtraction)
+- the offset formula **still** drives the server-ball dot + prediction
+  exactly as designed (`2 × (pings + machine)`)
+- 🔒 this file is now a **PROTECTED BUILD**: identifiers mangled, all strings
+  + the whole body encrypted (loadstring wrapper). The readable source is
+  kept private by the owner
+
+**v26.3 — SURVIVAL FIX:** auto spam only engages when the ball is actually
+targeting YOU; fires capped 14/engagement @ 0.09 s; target-attribute flicker
+can no longer re-arm the parry; panic lateral tolerance tightened.
 
 **v26.2 — SMOOTH + MINIMAL update:**
 - **BYAKU-BOT** — an ascii robot lives in the Dynamic Island: blinks, smiles, jumps up every now and then (zero-cost text animation)
@@ -50,10 +71,12 @@ the extrapolated server ball in real time.
 ### v26.1 — time-to-impact interception (long range, high speed)
 
 ```
-tti      = along-path distance / speed          (closest point on flight path)
+tti      = along-path distance / speed          (closest point on flight path,
+                                                 measured from the REAL ball — v26.4)
 lateral  = miss-distance of the path from you
 fire when  tti ≤ fireWindow  AND  lateral ≤ hitRadius
-fireWindow = clamp(offset + 0.07 + speed/5000, 0.09, 0.55)
+fireWindow = clamp(offset/2 + 0.05 + speed/6000, 0.08, 0.42)   (v26.4: pure send lead)
+proximity fallback uses REAL distance only (v26.4)
 ```
 
 - **Distance-independent** — a 700 stud/s ball triggers on TIME, never on a
@@ -63,7 +86,7 @@ fireWindow = clamp(offset + 0.07 + speed/5000, 0.09, 0.55)
   at long range).
 - **Adaptive cooldown** — `0.5 − speed/1600` (0.14–0.5 s): fast balls re-arm
   fast, so a wasted early fire can still be corrected.
-- **PANIC refire** — contact imminent (`tti ≤ 45%` of window): fires anyway,
+- **PANIC refire** — contact imminent (`tti ≤ 50%` of window): fires anyway,
   curve veto ignored, up to 4 attempts per target cycle.
 - **Proximity fallback** — the old radius trigger still handles slow/close
   balls (trusted under 140 stud/s, or inside 70 studs).
@@ -100,5 +123,6 @@ Close (`×`) unloads the script completely.
 | --- | --- |
 | `PRY NO GETGC` | Executor lacks `getgc` — hook replay unavailable, use Button method |
 | Capture never arms | Tap block once manually so the game sends the real packet |
-| Parries feel early/late | Watch the OFFSET stat — it is `2×(pings + machine delay)` by design; curve balls are skipped automatically |
+| Parries feel early/late | Watch the OFFSET stat — it is `2×(pings + machine delay)` by design; v26.4 fixed the double-counted lead, so fires now land ~`1×(pings+machine)` before contact |
 | Dies at long range / high speed | Fixed in v26.1 — TTI trigger + panic refire. Watch the island: it shows live `TTI 0.xx` countdown when targeted |
+| Fires when the ball is far away | Fixed in v26.4 — the trigger used the time-extrapolated ball and read it as "close"; it now measures the real ball only |
