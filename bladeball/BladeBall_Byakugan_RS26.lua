@@ -1,5 +1,5 @@
 -- ============================================================
--- Blade Ball Mobile — BYAKUGAN RS26.5  (Audi RS × iOS 26 Fluid)
+-- Blade Ball Mobile — BYAKUGAN RS26.6  (Audi RS × iOS 26 Fluid)
 -- ============================================================
 -- UI   : the original RS HUD is back — same Tango Red / Carbon
 --        Audi look, rebuilt with iOS 26 liquid-glass motion:
@@ -81,6 +81,17 @@
 --          the animation thread ever dies mid-way
 --        · executor fetches WITHOUT the HttpGet cache flag — a stale
 --          cached build is a classic "executed, nothing happened"
+-- v26.6 — PREDICT PARRY (new):
+--        · PREDICT stepper: OFF / 25 / 50 / 75 / 100 % — the trigger
+--          measures a PREDICTED future ball position instead of the
+--          real one: lead = pct x parry offset, extrapolated with the
+--          same second-order curve model as the yellow server dot
+--        · fires earlier by design — for high ping or very fast balls
+--          where the default window still feels a touch late
+--        · the fire window is untouched (pure send lead): the predict
+--          lead lives on the measurement side only, so the v26.4
+--          double-count can never come back
+--        · default OFF — current timing unchanged until you dial it in
 -- ============================================================
 
 -- ============================================================
@@ -172,6 +183,12 @@ local function byakFatal(msg)
                 t2.Parent = box
         end)
 end
+
+-- v26.6 PREDICT lead — declared in the MAIN CHUNK on purpose: the
+-- xpcall body below sits AT the 200-active-local compiler limit
+-- (PUC Lua and Luau both cap a function scope at 200), so this new
+-- state must live out here and ride INTO the script as an upvalue.
+local predictPct = 0 -- 0 = OFF; else lead fraction (0.25 / 0.5 / 0.75 / 1) of the parry offset
 
 xpcall(function()
 
@@ -721,7 +738,7 @@ local function serverBallPos(ball, zoomies, offset)
                         if not b.Parent then ballVelTrack[b] = nil end
                 end
         end
-        return ball.Position + vel * offset + acc * (offset * offset * 0.5)
+        return ball.Position + vel * offset + acc * (offset * offset * 0.5), acc
 end
 
 -- Fire window: how many seconds BEFORE impact we release the
@@ -1231,7 +1248,7 @@ create("TextLabel", {
 create("TextLabel", {
         Size = UDim2.new(1, -120, 0, 12), Position = UDim2.new(0, 56, 0, 27),
         BackgroundTransparency = 1,
-        Text = "RS26.2 · HOOK REPLAY · PERF",
+        Text = "RS26.6 · PREDICT · PERF",
         Font = Enum.Font.GothamBold, TextSize = 8,
         TextColor3 = THEME.TextDim, TextXAlignment = Enum.TextXAlignment.Left,
         Parent = header, ZIndex = 3,
@@ -1962,6 +1979,14 @@ makeStepperRow("CURVE MODE",
                 pushStatus("Curve: " .. opt, 1.2)
         end)
 
+makeStepperRow("PREDICT",
+        { "OFF", "25%", "50%", "75%", "100%" }, 1,
+        function(i, opt)
+                predictPct = ({ 0, 0.25, 0.5, 0.75, 1 })[i]
+                pushStatus(opt == "OFF" and "Predict off"
+                        or "Predict lead " .. opt, 1.2)
+        end)
+
 -- ============================================================
 -- [17] LIVE STATS STRIP + DIAGNOSTICS + FOOTER
 -- ============================================================
@@ -2309,10 +2334,11 @@ renderConn = RunService.RenderStepped:Connect(function()
                         if zoomies then
                                 local vel = zoomies.VectorVelocity
                                 local offset = getParryTimeOffset()
-                                local sp = serverBallPos(ball, zoomies, offset)
+                                local sp, acc2 = serverBallPos(ball, zoomies, offset)
                                 framePhys = {
                                         vel = vel, speed = vel.Magnitude,
                                         serverPos = sp, offset = offset,
+                                        acc = acc2, -- v26.6: feeds PREDICT extrapolation
                                 }
                                 serverBallDot.Position = sp
                         else
@@ -2420,10 +2446,31 @@ renderConn = RunService.RenderStepped:Connect(function()
                                         -- spam + early parries. Distance-independent:
                                         -- a 700 stud/s ball from 500 studs still triggers
                                         -- on TIME, not on a radius it crosses in a frame.
+                                        -- v26.6 PREDICT: optional future-ball
+                                        -- measurement. Lead = PREDICT% x parry
+                                        -- offset, second-order (same curve
+                                        -- model as the yellow dot). It lives
+                                        -- ONLY on the measurement side — the
+                                        -- fire window stays the pure v26.4
+                                        -- send lead, so leads never stack.
+                                        local measPos = ball.Position
+                                        if predictPct > 0 then
+                                                local lead = predictPct
+                                                        * getParryTimeOffset()
+                                                if framePhys then
+                                                        measPos = ball.Position
+                                                                + vel * lead
+                                                                + framePhys.acc
+                                                                        * (lead * lead * 0.5)
+                                                else
+                                                        measPos = ball.Position
+                                                                + vel * lead
+                                                end
+                                        end
                                         local tti, lateral = math.huge, math.huge
                                         if speed > 1 then
                                                 local dir = vel.Unit
-                                                local rel = root.Position - ball.Position
+                                                local rel = root.Position - measPos
                                                 local along = rel:Dot(dir)
                                                 if along > 0 then
                                                         tti = along / speed
@@ -2437,7 +2484,9 @@ renderConn = RunService.RenderStepped:Connect(function()
                                         -- distServer is the ball pushed `offset` seconds
                                         -- into its own future; using it here let a 250-stud
                                         -- ball read as "10 studs" and fire across the map.
-                                        local nearDist = distReal
+                                        local nearDist = predictPct > 0
+                                                and (root.Position - measPos).Magnitude
+                                                or distReal
                                         local proxHit = nearDist <= accuracy
                                                 and (speed < 140 or nearDist < 70)
                                         -- PANIC: contact in the last ~half of the send
@@ -2462,7 +2511,8 @@ renderConn = RunService.RenderStepped:Connect(function()
                                                 lastTtiBucket = -1
                                                 fxBurst()
                                                 fireSelected()
-                                                setBaseStatus("TTI PARRY")
+                                                setBaseStatus(predictPct > 0
+                                                        and "PREDICT PARRY" or "TTI PARRY")
                                         elseif armed and panic and parryRetries < 4
                                                 and os.clock() - lastAutoFireAt >= 0.08 then
                                                 -- last-resort refire: contact imminent, the
