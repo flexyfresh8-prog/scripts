@@ -1,5 +1,5 @@
 -- ============================================================
--- Blade Ball Mobile — BYAKUGAN RS27  (Audi RS × iOS 26 Fluid)
+-- Blade Ball Mobile — BYAKUGAN RS27.1  (Audi RS × iOS 26 Fluid)
 -- ============================================================
 -- UI   : the original RS HUD is back — same Tango Red / Carbon
 --        Audi look, rebuilt with iOS 26 liquid-glass motion:
@@ -170,6 +170,26 @@
 --          engage / 14 release / hover-ball cooldowns unchanged
 --        · new NEURA stepper (ON/OFF, default ON; OFF = exact
 --          v26.9 behavior)
+-- v27.1 — APPROACH RESOLVER (double-parry, round two):
+--        · WHY v26.7 STILL DOUBLED: the once-per-approach gate
+--          released when the ball's velocity drifted > 6 studs/s —
+--          but the ball HOMES, so a dodging target bends it past
+--          that within ~0.1 s. The gate dissolved, the lockout
+--          expired, and the TTI branch fired a SECOND packet on the
+--          same approach — plus a deflected ball grazing us could
+--          bait PANIC the instant the redirect changed the velocity
+--        · the gate no longer reads velocity at all: TTI fires
+--          exactly ONCE per approach — release ONLY on a target
+--          change, a new ball, or a 1.2 s failsafe
+--        · a per-frame watcher latches the approach-ending event:
+--          an instant direction flip (dot < 0.3 between frames — a
+--          curve bends < 5 deg/frame, a redirect is 90+ at once)
+--        · PANIC stays the true-miss last chance (no flip seen,
+--          retries <= 4) but is BLOCKED once the redirect is
+--          observed — a resolved approach can never spend the
+--          game's parry cooldown on a wasted packet
+--        · a target change re-arms everything (lastFireInfo cleared
+--          + flip latch reset) — 1v1 rallies keep working
 -- ============================================================
 
 -- ============================================================
@@ -500,6 +520,57 @@ local function neuraObserve(ball, root, framePhys)
         if os.clock() - s.at > 3 then
                 if s.minD < 15 then neuraTrain(s, s.tMin) end
                 neuraSession = nil
+        end
+end
+
+-- ============================================================
+-- v27.1 APPROACH RESOLVER — the double-parry killer, round two.
+-- v26.7 gated the TTI refire on "velocity unchanged within 6
+-- studs/s" — but the ball HOMES: its velocity tracks a dodging
+-- target, so a 100 stud/s ball bends > 6 studs/s within ~0.1 s
+-- and the gate dissolved long before the server's redirect had
+-- its chance to arrive (2 x ping). After that the TTI branch was
+-- free to fire a SECOND packet on the same approach — the double
+-- the user still saw. The watcher now latches the ONE event that
+-- truly ends an approach: an instant direction flip (dot < 0.3
+-- between consecutive frames — a curve bends < 5 deg/frame, a
+-- redirect is 90+ deg at once). TTI then fires exactly ONCE per
+-- approach: release only on target change / new ball / 1.2 s
+-- failsafe. PANIC stays open for true misses (no flip) but is
+-- BLOCKED the moment a flip is seen, so a deflected ball can no
+-- longer bait a wasted packet into the game's parry cooldown.
+-- Same main-chunk rule as NEURA: the xpcall body is at the
+-- 200-local limit and only calls these functions.
+-- ============================================================
+local apBall, apDir, apFlipAt = nil, nil, nil
+local function watchApproach(ball, framePhys)
+        if ball ~= apBall then
+                apBall, apDir, apFlipAt = ball, nil, nil
+        end
+        if not ball then return end
+        local vel = framePhys and framePhys.vel
+        if not vel or vel.Magnitude < 1 then
+                local ok, v = pcall(function()
+                        local z = ball:FindFirstChild("zoomies")
+                        return z and z.VectorVelocity
+                                or ball.AssemblyLinearVelocity
+                end)
+                if ok and v and v.Magnitude > 1 then vel = v end
+        end
+        if not vel or vel.Magnitude < 1 then return end
+        local dir = vel.Unit
+        if apDir and not apFlipAt and apDir:Dot(dir) < 0.3 then
+                apFlipAt = os.clock()
+        end
+        apDir = dir
+end
+local function approachResolvedSince(ball, t)
+        return apBall == ball and apFlipAt ~= nil and apFlipAt >= t
+end
+local function watchReset(ball)
+        if apBall == ball then
+                apFlipAt = nil
+                apDir = nil
         end
 end
 
@@ -1561,7 +1632,7 @@ create("TextLabel", {
 create("TextLabel", {
         Size = UDim2.new(1, -120, 0, 12), Position = UDim2.new(0, 56, 0, 27),
         BackgroundTransparency = 1,
-        Text = "RS27 · NEURA · PREDICT · PERF",
+        Text = "RS27.1 · NEURA · PREDICT · PERF",
         Font = Enum.Font.GothamBold, TextSize = 8,
         TextColor3 = THEME.TextDim, TextXAlignment = Enum.TextXAlignment.Left,
         Parent = header, ZIndex = 3,
@@ -2697,6 +2768,8 @@ renderConn = RunService.RenderStepped:Connect(function()
 
                 -- v27.0 NEURA: observe/train the fired approach
                 neuraObserve(ball, root, framePhys)
+                -- v27.1: latch the approach-ending redirect flip
+                watchApproach(ball, framePhys)
 
                 -- ===== AUTO SPAM (v26.9 — proximity-only) =====
                 -- v26.9: engages on PURE PROXIMITY — the ball within 10
@@ -2769,6 +2842,12 @@ renderConn = RunService.RenderStepped:Connect(function()
                                                 parriedUntil = 0
                                                 parryRetries = 0
                                                 lastTtiBucket = -1
+                                                -- v27.1: a target change ENDS the
+                                                -- approach — the once-per-approach
+                                                -- gate and the flip latch re-arm for
+                                                -- the next exchange
+                                                lastFireInfo = nil
+                                                watchReset(ball)
                                         end
                                         local speed, serverPos
                                         if framePhys then
@@ -2868,17 +2947,23 @@ renderConn = RunService.RenderStepped:Connect(function()
 
                                         -- v26.7 ANTI-DOUBLE-PARRY: after an auto fire
                                         -- the ball state is STALE for ~2 x ping (the
-                                        -- redirect hasn't replicated). Same ball +
-                                        -- same target + same velocity = the SAME
-                                        -- approach: the TTI branch must not fire
-                                        -- again on it — that second packet is the
-                                        -- wasted double that starts the game's parry
-                                        -- cooldown right before contact. Re-fires go
-                                        -- through PANIC only (last chance, capped).
+                                        -- redirect hasn't replicated), so the TTI
+                                        -- branch must not fire twice on one approach.
+                                        -- v27.1 REWRITE: the old 6-stud/s
+                                        -- velocity release was the double's hiding
+                                        -- spot — a homing ball bends its velocity
+                                        -- > 6 studs/s within ~0.1 s, the gate
+                                        -- dissolved, and after the lockout the TTI
+                                        -- branch re-fired on the SAME approach.
+                                        -- An approach is now closed ONLY by a
+                                        -- target change, a new ball, or the 1.2 s
+                                        -- failsafe — true misses still get PANIC
+                                        -- (retries <= 4), which the observed
+                                        -- redirect blocks
                                         local sameApproach = lastFireInfo ~= nil
                                                 and lastFireInfo.ball == ball
                                                 and target == lastFireInfo.target
-                                                and (vel - lastFireInfo.vel).Magnitude <= 6
+                                                and os.clock() - lastFireInfo.t <= 1.2
 
                                         if armed and (ttiHit or proxHit)
                                                 and not sameApproach
@@ -2913,6 +2998,16 @@ renderConn = RunService.RenderStepped:Connect(function()
                                                 setBaseStatus(predictPct > 0
                                                         and "PREDICT PARRY" or "TTI PARRY")
                                         elseif armed and panic and parryRetries < 4
+                                                -- v27.1: a flip after our fire = the
+                                                -- parry RESOLVED (redirect replicated);
+                                                -- a deflected ball grazing us must not
+                                                -- bait a last-chance packet into the
+                                                -- game's parry cooldown. No flip = true
+                                                -- miss = PANIC stays armed
+                                                and not (lastFireInfo ~= nil
+                                                        and lastFireInfo.ball == ball
+                                                        and approachResolvedSince(
+                                                                ball, lastFireInfo.t))
                                                 and os.clock() - lastAutoFireAt >= 0.08 then
                                                 -- last-resort refire: contact imminent, the
                                                 -- curve veto no longer outranks survival
