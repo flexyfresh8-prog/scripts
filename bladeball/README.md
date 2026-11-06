@@ -1,9 +1,25 @@
-# Blade Ball — BYAKUGAN RS26.4 (Audi RS × iOS 26 Fluid)
+# Blade Ball — BYAKUGAN RS26.5 (Audi RS × iOS 26 Fluid)
 
 Mobile auto-parry for **Roblox Blade Ball**, built for **Delta iOS**.
 The original **RS HUD** is back — Tango Red / Carbon Audi look — rebuilt with
 iOS 26 liquid-glass motion: spring bounces, elastic pops, fluid steppers,
 parry shockwaves, a Dynamic Island and an animated boot sequence.
+
+**v26.5 — BOOT FAILSAFE ("never gets past booting" — fixed):**
+- the `getgc` PRY scan **never yielded** — on a long-running server the heap
+  is huge and the scan used to hog the VM for 30+ s, freezing the boot card,
+  the tracer and the whole game mid-boot. It now **yields every 1000
+  objects** — same objects, same token, same result, just without starving
+  the VM
+- **single-flight scan guard** — hook install, the boot animation and the
+  diag panel could race each other into two concurrent full-heap scans
+- the post-animation tail is **pcall'd**, and a **9 s failsafe** force-
+  finishes the boot: boot card destroyed, HUD pill shown, main panel opened —
+  the boot can no longer stick on screen, ever
+- **loadstrings no longer use the HttpGet cache flag** — a stale cached build
+  is a classic cause of "executed, nothing happened". If your pill still says
+  `RS26.4`, your executor is serving an old cached copy: fully close Roblox
+  and re-execute
 
 **v26.4 — TIMING FIX (cross-map spam + early parries):**
 - the trigger measured the **phantom ball** (position already pushed `offset`
@@ -45,14 +61,14 @@ cooldown + panic refire. No more dying to 500+ stud/s balls from 300+ studs.
 Main (slim protected build):
 
 ```lua
-loadstring(game:HttpGet("https://raw.githubusercontent.com/YOUR-USERNAME/scripts/main/bladeball/BladeBall_Byakugan_RS26.lua", true))()
+loadstring(game:HttpGet("https://raw.githubusercontent.com/YOUR-USERNAME/scripts/main/bladeball/BladeBall_Byakugan_RS26.lua"))()
 ```
 
 Fully sealed (vault) build — same engine, encrypted payload, shows a boot
 status pill at the top of the screen while loading:
 
 ```lua
-loadstring(game:HttpGet("https://raw.githubusercontent.com/YOUR-USERNAME/scripts/main/bladeball/BladeBall_Byakugan_RS26_vault.lua", true))()
+loadstring(game:HttpGet("https://raw.githubusercontent.com/YOUR-USERNAME/scripts/main/bladeball/BladeBall_Byakugan_RS26_vault.lua"))()
 ```
 
 > Replace `YOUR-USERNAME` with your GitHub username. The repo must be public
@@ -133,7 +149,8 @@ Close (`×`) unloads the script completely.
 
 | Symptom | Fix |
 | --- | --- |
-| Executed, nothing popped up | A small dark pill `BYAKUGAN RS26.4 ▸ booting…` should appear top-center within ~2 s. **No pill at all** → the fetch failed (check Delta console, re-execute, or GitHub rate-limited — wait a minute). **Pill shows, then vanishes, no HUD** → script error — switch to the vault build, whose pill prints the exact stage + error text |
+| Stuck at `booting…` / boot card % never finishes (v26.4 and older) | Fixed in v26.5 — the PRY scan used to freeze the whole game on big servers, and a dead animation thread could leave the boot card up forever. The scan now yields and a 9 s failsafe force-finishes the boot. Check the pill: it must say **`RS26.5`** — if it still says `RS26.4` you are running a stale cached build (fully close Roblox, re-execute) |
+| Executed, nothing popped up | A small dark pill `BYAKUGAN RS26.5 ▸ booting…` should appear top-center within ~2 s. **No pill at all** → the fetch failed (check Delta console, re-execute, or GitHub rate-limited — wait a minute). **Pill shows, then vanishes, no HUD** → script error — switch to the vault build, whose pill prints the exact stage + error text. The green `[BYAK 1/6] → [BYAK ✓]` tracer below the pill shows the live boot stage at all times |
 | `PRY NO GETGC` | Executor lacks `getgc` — hook replay unavailable, use Button method |
 | Capture never arms | Tap block once manually so the game sends the real packet |
 | Parries feel early/late | Watch the OFFSET stat — it is `2×(pings + machine delay)` by design; v26.4 fixed the double-counted lead, so fires now land ~`1×(pings+machine)` before contact |
