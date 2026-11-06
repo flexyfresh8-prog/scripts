@@ -13,14 +13,26 @@
 --           itself sends is captured (tap block once to arm).
 --        3. Auto-parry REPLAYS that exact packet with a fresh
 --           token + live curve CFrame + entity screen data.
--- PARRY MATH (new):
+-- PARRY MATH:
 --        parry_time_offset = 2 x (playerPing + clientPing
 --                                    + machineDelay)
---        applied to extrapolate the SERVER-side ball position:
---        serverBallPos = ballPos + ballVel * offset
---        Trigger fires when the server ball (or the real ball)
---        enters the NAZK parry-accuracy radius.
--- AUTO SPAM (new):
+--        applied to extrapolate the SERVER-side ball position.
+-- LONG-RANGE HS (v26.1) — time-to-impact interception:
+--        1. Second-order extrapolation: velocity ACCELERATION
+--           is tracked per-frame, server ball = pos + vel*t
+--           + 0.5*acc*t^2 (curved flight, not a straight lie).
+--        2. Path/TTI trigger: closest-point-on-path math —
+--           lateral miss-distance + time-to-impact along the
+--           ball's flight path. Fires when TTI <= fire window
+--           (offset + margin + speed spread). Frame-rate and
+--           DISTANCE independent — no more dying at 400 studs.
+--        3. Curve-veto cap: other players' parries can only
+--           block your parry max 1.2 s, no matter the range.
+--        4. Adaptive cooldown: 0.72 s at slow balls down to
+--           0.16 s at 800+ studs/s, plus PANIC refire when the
+--           ball is about to connect — a wasted early fire no
+--           longer means death.
+-- AUTO SPAM:
 --        distance(ball -> its target) <= 15 studs  ->  spam
 --        ENGAGES (rapid hook-replay fires) and releases above
 --        22 studs (hysteresis, no flicker).
@@ -133,6 +145,7 @@ local lastSpamAt     = 0
 local spamFireCount  = 0
 local spamActive     = false         -- NEW: auto-spam engaged state
 local parriedUntil   = 0
+local parryRetries   = 0
 local lastTargetOf   = {}
 local deathActive    = false
 local infActive      = false
@@ -558,17 +571,67 @@ local function isCurved(ball, pingSec)
         curveProps.lerpRadians = curveProps.lerpRadians + (radians - curveProps.lerpRadians) * 0.85
         if curveProps.lerpRadians < 0.016 then curveProps.lastWarping = os.clock() end
         if distance < distThreshold * 0.85 then return false end
-        if os.clock() - curveProps.lastWarping < reachTime / 1.4 then return true end
-        if os.clock() - curveProps.curving < reachTime / 1.1 then return true end
+        -- v26.1: cap the veto windows — at long range reachTime is
+        -- huge and the old math kept the parry deaf for seconds.
+        if os.clock() - curveProps.lastWarping < math.min(reachTime / 1.4, 1.2) then return true end
+        if os.clock() - curveProps.curving < math.min(reachTime / 1.1, 1.2) then return true end
         return dot < dotThreshold
 end
 
 -- NAZK parry-accuracy radius: ping + speed derived
 local function parryAccuracy(speed, pingSec)
-        local pingThreshold = math.clamp(pingSec * 10, 5, 17)
-        local capped = math.min(math.max(speed - 9.5, 0), 650)
-        local divisor = 2.4 + capped * 0.002
+        local pingThreshold = math.clamp(pingSec * 10, 5, 20)
+        local capped = math.min(math.max(speed - 9.5, 0), 900)
+        local divisor = 2.4 + capped * 0.0018
         return pingThreshold + math.max(speed / divisor, 9.5)
+end
+
+-- ============================================================
+-- [7b] LONG-RANGE HS — TTI interception core (v26.1)
+-- ============================================================
+-- Per-ball velocity tracking -> ACCELERATION estimate, so the
+-- server-ball extrapolation follows CURVED flight instead of a
+-- straight line that lies more the further the ball is.
+local ballVelTrack = {}
+local function serverBallPos(ball, zoomies, offset)
+        local vel = zoomies.VectorVelocity
+        local now = os.clock()
+        local acc = Vector3.zero
+        local prev = ballVelTrack[ball]
+        if prev then
+                local dt = now - prev.t
+                if dt > 0.001 and dt < 0.25 then
+                        acc = (vel - prev.v) / dt
+                        local am = acc.Magnitude
+                        if am > 600 then
+                                acc = acc * (600 / am)
+                        end
+                end
+        end
+        ballVelTrack[ball] = { v = vel, t = now }
+        -- occasional sweep of destroyed balls (tiny state, stays tiny)
+        if math.random(1, 120) == 1 then
+                for b in pairs(ballVelTrack) do
+                        if not b.Parent then ballVelTrack[b] = nil end
+                end
+        end
+        return ball.Position + vel * offset + acc * (offset * offset * 0.5)
+end
+
+-- Fire window: how many seconds BEFORE impact we release the
+-- parry so the request lands inside the server's validation
+-- window. offset covers packet travel; the rest covers the
+-- parry reaction margin + a little speed spread.
+local function ttiFireWindow(speed)
+        local w = getParryTimeOffset() + 0.07 + speed / 5000
+        return math.clamp(w, 0.09, 0.55)
+end
+
+-- Adaptive cooldown: fast balls re-arm FAST so a wasted early
+-- fire can be corrected before contact; slow balls stay quiet.
+-- (Guaranteed shorter than the panic window: refire is reachable.)
+local function parryCooldown(speed)
+        return math.clamp(0.5 - speed / 1600, 0.14, 0.5)
 end
 
 -- ============================================================
@@ -1843,12 +1906,28 @@ renderConn = RunService.RenderStepped:Connect(function()
                 local ball = getActiveBall()
                 local char = LocalPlayer.Character
                 local root = char and char:FindFirstChild("HumanoidRootPart")
+                -- per-frame ball physics, computed ONCE (serverBallPos
+                -- tracks acceleration — it must run a single time/frame)
+                local framePhys = nil
 
                 -- yellow dot = SERVER-side ball, extrapolated by the
                 -- parry time offset: 2 x (playerPing + clientPing + machineDelay)
+                -- (v26.1: second-order — follows curved flight)
                 if ball and root then
-                        local vel = ballVelocity(ball)
-                        serverBallDot.Position = ball.Position + vel * getParryTimeOffset()
+                        local zoomies = ball:FindFirstChild("zoomies")
+                        if zoomies then
+                                local vel = zoomies.VectorVelocity
+                                local offset = getParryTimeOffset()
+                                local sp = serverBallPos(ball, zoomies, offset)
+                                framePhys = {
+                                        vel = vel, speed = vel.Magnitude,
+                                        serverPos = sp, offset = offset,
+                                }
+                                serverBallDot.Position = sp
+                        else
+                                serverBallDot.Position = ball.Position
+                                        + ballVelocity(ball) * getParryTimeOffset()
+                        end
                         if auraEnabled and not char:FindFirstChild("ByakuganAura") then setupAura() end
                 else
                         serverBallDot.Position = Vector3.new(0, -100, 0)
@@ -1881,7 +1960,7 @@ renderConn = RunService.RenderStepped:Connect(function()
                         end
                 end
 
-                -- ===== AUTO PARRY (NAZK trigger + server-ball offset) =====
+                -- ===== AUTO PARRY (TTI interception + server-ball offset) =====
                 if isRunning then
                         if ball and root then
                                 local zoomies = ball:FindFirstChild("zoomies")
@@ -1890,25 +1969,78 @@ renderConn = RunService.RenderStepped:Connect(function()
                                         if lastTargetOf[ball] ~= target then
                                                 lastTargetOf[ball] = target
                                                 parriedUntil = 0
+                                                parryRetries = 0
                                         end
-                                        local speed = zoomies.VectorVelocity.Magnitude
-                                        local serverPos = ball.Position
-                                                + zoomies.VectorVelocity * getParryTimeOffset()
+                                        local speed, serverPos
+                                        if framePhys then
+                                                speed = framePhys.speed
+                                                serverPos = framePhys.serverPos
+                                        else
+                                                speed = zoomies.VectorVelocity.Magnitude
+                                                serverPos = ball.Position
+                                                        + zoomies.VectorVelocity * getParryTimeOffset()
+                                        end
+                                        local vel = framePhys and framePhys.vel
+                                                or zoomies.VectorVelocity
                                         local distServer = (serverPos - root.Position).Magnitude
                                         local distReal = (root.Position - ball.Position).Magnitude
                                         local accuracy = parryAccuracy(speed, pingSec)
-                                        if os.clock() >= parriedUntil
+
+                                        -- PATH / TTI MATH — closest point of the ball's
+                                        -- flight path to us, measured from the SERVER ball.
+                                        -- Distance-independent: a 700 stud/s ball from 500
+                                        -- studs triggers on TIME, not on a radius it can
+                                        -- cross between two frames.
+                                        local tti, lateral = math.huge, math.huge
+                                        if speed > 1 then
+                                                local dir = vel.Unit
+                                                local rel = root.Position - serverPos
+                                                local along = rel:Dot(dir)
+                                                if along > 0 then
+                                                        tti = along / speed
+                                                        lateral = (rel - dir * along).Magnitude
+                                                end
+                                        end
+                                        local fireTti = ttiFireWindow(speed)
+                                        local hitRadius = math.max(accuracy * 0.55, 12)
+                                        local ttiHit = tti <= fireTti and lateral <= hitRadius
+                                        -- proximity fallback — only trusted close-in,
+                                        -- where extrapolation error is small
+                                        local nearDist = math.min(distServer, distReal)
+                                        local proxHit = nearDist <= accuracy
+                                                and (speed < 140 or nearDist < 70)
+                                        -- PANIC: contact in < ~0.15 s — curve veto ignored
+                                        local panic = tti <= fireTti * 0.45
+                                                and lateral <= hitRadius * 3
+                                        local blocked = deathActive or infActive
+                                                or ball:FindFirstChild("ComboCounter") ~= nil
+                                                or root:FindFirstChild("SingularityCape") ~= nil
+                                        local armed = os.clock() >= parriedUntil
                                                 and target == LocalPlayer.Name
-                                                and not isCurved(ball, pingSec)
-                                                and ball:FindFirstChild("ComboCounter") == nil
-                                                and root:FindFirstChild("SingularityCape") == nil
-                                                and not deathActive and not infActive
-                                                and (distServer <= accuracy or distReal <= accuracy) then
-                                                parriedUntil = os.clock() + 1
+                                                and not blocked
+
+                                        if armed and (ttiHit or proxHit)
+                                                and not isCurved(ball, pingSec) then
+                                                parriedUntil = os.clock() + parryCooldown(speed)
+                                                parryRetries = math.min(parryRetries + 1, 4)
                                                 fxBurst()
                                                 fireSelected()
+                                                setBaseStatus("TTI PARRY")
+                                        elseif armed and panic and parryRetries < 4 then
+                                                -- last-resort refire: contact imminent, the
+                                                -- curve veto no longer outranks survival
+                                                parriedUntil = os.clock()
+                                                        + parryCooldown(speed) * 0.6
+                                                parryRetries = parryRetries + 1
+                                                fxBurst()
+                                                fireSelected()
+                                                setBaseStatus("PANIC PARRY")
                                         elseif target == LocalPlayer.Name then
-                                                if math.min(distServer, distReal) <= accuracy + 14 then
+                                                if blocked then
+                                                        setBaseStatus("PROTECTED")
+                                                elseif tti < math.huge and tti <= fireTti + 0.6 then
+                                                        setBaseStatus(string.format("TTI %.2f", tti))
+                                                elseif nearDist <= accuracy + 14 then
                                                         setBaseStatus("Getting close")
                                                 else
                                                         setBaseStatus("Tracking")
