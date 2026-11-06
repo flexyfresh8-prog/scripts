@@ -5,6 +5,16 @@ The original **RS HUD** is back — Tango Red / Carbon Audi look — rebuilt wit
 iOS 26 liquid-glass motion: spring bounces, elastic pops, fluid steppers,
 parry shockwaves, a Dynamic Island and an animated boot sequence.
 
+**v26.5.1 — OBFUSCATION REMOVED (plain build):**
+- the protected/obfuscated builds kept dying silently on Delta — the wrapper
+  pill stuck at `booting…` while the encrypted body never ran, so there was
+  nothing to debug
+- **both links now serve the identical plain, readable build** — the same
+  engine, the same v26.5 boot failsafe, just no mangling/encryption in the
+  way. If anything fails, the tracer pill prints the exact stage and the
+  Delta console shows the real Lua error
+- protection will come back only in a form that provably runs on Delta
+
 **v26.5 — BOOT FAILSAFE ("never gets past booting" — fixed):**
 - the `getgc` PRY scan **never yielded** — on a long-running server the heap
   is huge and the scan used to hog the VM for 30+ s, freezing the boot card,
@@ -34,12 +44,8 @@ parry shockwaves, a Dynamic Island and an animated boot sequence.
   subtraction)
 - the offset formula **still** drives the server-ball dot + prediction
   exactly as designed (`2 × (pings + machine)`)
-- 🔒 both published files are **PROTECTED BUILDS** — mangled identifiers,
-  encrypted strings, no comments. The readable source is kept private by
-  the owner:
-  - **Main file** — slim protected build: runs directly (no wrapper)
-  - **Vault file** — fully sealed: the whole body is additionally encrypted
-    behind a loadstring payload, with staged on-screen boot diagnostics
+- ~~🔒 protected builds~~ — **removed in v26.5.1** (they broke boot on Delta;
+  both links serve the plain build again)
 
 **v26.3 — SURVIVAL FIX:** auto spam only engages when the ball is actually
 targeting YOU; fires capped 14/engagement @ 0.09 s; target-attribute flicker
@@ -58,14 +64,14 @@ cooldown + panic refire. No more dying to 500+ stud/s balls from 300+ studs.
 
 ## Run it (Delta mobile)
 
-Main (slim protected build):
+Main build (plain, v26.5.1):
 
 ```lua
 loadstring(game:HttpGet("https://raw.githubusercontent.com/YOUR-USERNAME/scripts/main/bladeball/BladeBall_Byakugan_RS26.lua"))()
 ```
 
-Fully sealed (vault) build — same engine, encrypted payload, shows a boot
-status pill at the top of the screen while loading:
+Vault link — currently serves the **same plain build** (kept so old saved
+loadstrings keep working):
 
 ```lua
 loadstring(game:HttpGet("https://raw.githubusercontent.com/YOUR-USERNAME/scripts/main/bladeball/BladeBall_Byakugan_RS26_vault.lua"))()
@@ -150,7 +156,7 @@ Close (`×`) unloads the script completely.
 | Symptom | Fix |
 | --- | --- |
 | Stuck at `booting…` / boot card % never finishes (v26.4 and older) | Fixed in v26.5 — the PRY scan used to freeze the whole game on big servers, and a dead animation thread could leave the boot card up forever. The scan now yields and a 9 s failsafe force-finishes the boot. Check the pill: it must say **`RS26.5`** — if it still says `RS26.4` you are running a stale cached build (fully close Roblox, re-execute) |
-| Executed, nothing popped up | A small dark pill `BYAKUGAN RS26.5 ▸ booting…` should appear top-center within ~2 s. **No pill at all** → the fetch failed (check Delta console, re-execute, or GitHub rate-limited — wait a minute). **Pill shows, then vanishes, no HUD** → script error — switch to the vault build, whose pill prints the exact stage + error text. The green `[BYAK 1/6] → [BYAK ✓]` tracer below the pill shows the live boot stage at all times |
+| Executed, nothing popped up | The green `[BYAK 1/6] → [BYAK ✓]` tracer pill top-center shows the live boot stage at all times. **No pill at all** → the fetch failed (check Delta console, re-execute, or GitHub rate-limited — wait a minute). **Pill turns red** → it prints the exact error — screenshot it and send it back. Plain build = real Lua errors in the Delta console too |
 | `PRY NO GETGC` | Executor lacks `getgc` — hook replay unavailable, use Button method |
 | Capture never arms | Tap block once manually so the game sends the real packet |
 | Parries feel early/late | Watch the OFFSET stat — it is `2×(pings + machine delay)` by design; v26.4 fixed the double-counted lead, so fires now land ~`1×(pings+machine)` before contact |
