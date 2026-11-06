@@ -1,9 +1,27 @@
-# Blade Ball — BYAKUGAN RS26.6 (Audi RS × iOS 26 Fluid)
+# Blade Ball — BYAKUGAN RS26.7 (Audi RS × iOS 26 Fluid)
 
 Mobile auto-parry for **Roblox Blade Ball**, built for **Delta iOS**.
 The original **RS HUD** is back — Tango Red / Carbon Audi look — rebuilt with
 iOS 26 liquid-glass motion: spring bounces, elastic pops, fluid steppers,
 parry shockwaves, a Dynamic Island and an animated boot sequence.
+
+**v26.7 — ANTI-DOUBLE-PARRY (fix):**
+- the trigger could fire a **second packet on the same approach**: the speed
+  cooldown is only `0.14 s` on fast balls, but the server's "ball parried
+  away" redirect takes `1–2 × ping` (0.1–0.3 s) to reach your client — until
+  it arrives the ball still reads as incoming and targeting you, so the TTI
+  branch (which had **no per-approach cap**) or PANIC fired again. The wasted
+  packet started the game's parry cooldown right before the real contact →
+  dead
+- **TTI now fires once per approach** — a refire needs the ball state to
+  actually change (redirect / curve / new target / spam shot in between);
+  a stale incoming ball can no longer re-trigger it
+- post-fire lockout now covers replication: `max(cooldown, 2 × ping + 0.06)`
+  — PANIC opens only after the redirect had its chance to arrive. A true
+  miss still gets the last-chance refire (retries ≤ 4 unchanged); a saved
+  approach stays silent
+- auto-spam shots also arm the gate, so the TTI branch can't stack a wasted
+  packet on top of an engagement that is already firing
 
 **v26.6 — PREDICT PARRY (new):**
 - new **PREDICT** stepper on the panel: `OFF · 25% · 50% · 75% · 100%`
@@ -187,3 +205,4 @@ Close (`×`) unloads the script completely.
 | Dies at long range / high speed | Fixed in v26.1 — TTI trigger + panic refire. Watch the island: it shows live `TTI 0.xx` countdown when targeted |
 | Fires when the ball is far away | Fixed in v26.4 — the trigger used the time-extrapolated ball and read it as "close"; it now measures the real ball only |
 | Parries too early with PREDICT on | PREDICT adds extra lead on top of the v26.4 window by design — step it down (50% → 25%) or set OFF; OFF is the v26.5 timing exactly |
+| Double parries, then dies on cooldown | Fixed in v26.7 — the second packet fired while the redirect was still replicating and wasted the parry cooldown before contact. TTI now fires once per approach and PANIC waits out `2 × ping + 0.06` first |
