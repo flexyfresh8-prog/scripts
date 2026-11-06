@@ -1,5 +1,5 @@
 -- ============================================================
--- Blade Ball Mobile — BYAKUGAN RS26.7  (Audi RS × iOS 26 Fluid)
+-- Blade Ball Mobile — BYAKUGAN RS26.8  (Audi RS × iOS 26 Fluid)
 -- ============================================================
 -- UI   : the original RS HUD is back — same Tango Red / Carbon
 --        Audi look, rebuilt with iOS 26 liquid-glass motion:
@@ -113,6 +113,27 @@
 --          read 0 for the first frames (or be missing on an executor)
 --          and that silently shrank the lockout back to the 0.14 s
 --          fast-ball cooldown — the double came back
+-- v26.8 — ROTATION CURVE (new):
+--        · the ball is steered by whoever it is locked ON: the server
+--          bends the flight with the steerer's replicated character
+--          rotation (camera flick = curve; first person is the mobile
+--          default, so root yaw IS view yaw). The script now tracks
+--          d(yaw)/dt of the steering player and predicts the lateral
+--          steering acceleration BEFORE the ball's own motion shows
+--          it — the measured acceleration always trails a flick
+--        · physics: turning a velocity vector at rate w costs
+--          speed x w of sideways accel, so a_rot = 0.4 x w x speed
+--          toward the steerer's turn side, capped at 900, deadband
+--          0.35 rad/s (ordinary aim drift is not a curve)
+--        · feeds the PREDICT measurement: measured acc + rotation acc
+--        · curve veto RELAXED under PREDICT + ROTATION: when the
+--          opponent's yaw rate confirms an active curve (>= 1 rad/s)
+--          and the predicted path still passes inside the hit radius,
+--          the TTI branch may fire DURING the curve — on-time parries
+--          on curved balls instead of the late PANIC-only fire.
+--          Without PREDICT the veto behaves exactly as before
+--        · new ROTATION stepper (ON/OFF, default ON — dormant until
+--          PREDICT is on)
 -- ============================================================
 
 -- ============================================================
@@ -216,6 +237,68 @@ local predictPct = 0 -- 0 = OFF; else lead fraction (0.25 / 0.5 / 0.75 / 1) of t
 -- again on the SAME ball with UNCHANGED target and velocity is a
 -- wasted double — the redirect packet just hasn't replicated yet.
 local lastFireInfo = nil
+-- v26.8 ROTATION CURVE — main chunk on purpose (the xpcall body is AT
+-- the 200-active-local compiler limit; new state rides in as upvalues).
+-- While the ball is locked on a player, THAT player steers it: the
+-- server bends the flight using the steerer's replicated character
+-- rotation (camera flick = curve; first person is the mobile default,
+-- so root yaw IS view yaw). Tracking d(yaw)/dt of the steering player
+-- predicts the curve BEFORE the ball's own motion shows it — the
+-- measured acceleration always trails an active flick.
+local rotCurveOn = true
+local yawTrack = {} -- [playerName] = { yaw, t, rate }
+local rotLastRate = 0 -- |yaw rate| rad/s of the LAST rotCurveAccel call
+
+-- Steering acceleration predicted from the steerer's yaw rate.
+-- Turning a velocity vector at rate w costs speed x w of sideways
+-- acceleration (centripetal identity); the game steers only partially,
+-- so a gain < 1 plus a hard cap keep the prediction honest. Also sets
+-- rotLastRate (single call site per frame reads it right after).
+local function rotCurveAccel(targetName, speed)
+        rotLastRate = 0
+        if type(targetName) ~= "string" or targetName == "" then
+                return Vector3.zero
+        end
+        local plr = game:GetService("Players"):FindFirstChild(targetName)
+        local root = plr and plr.Character
+                        and plr.Character:FindFirstChild("HumanoidRootPart")
+        local tr = yawTrack[targetName]
+        if not root then
+                yawTrack[targetName] = nil
+                return Vector3.zero
+        end
+        local look = root.CFrame.LookVector
+        local hx, hz = look.X, look.Z
+        if hx * hx + hz * hz < 0.0025 then
+                -- staring near straight up/down — no yaw information
+                return Vector3.zero
+        end
+        local yaw = math.atan2(-hx, -hz) -- 0 = facing -Z; LEFT turn = positive
+        local now = os.clock()
+        local rate = 0
+        if tr then
+                local dt = math.clamp(now - tr.t, 1 / 240, 0.25)
+                local dYaw = yaw - tr.yaw
+                if dYaw > math.pi then
+                        dYaw = dYaw - 2 * math.pi
+                elseif dYaw < -math.pi then
+                        dYaw = dYaw + 2 * math.pi
+                end
+                rate = tr.rate + (dYaw / dt - tr.rate) * 0.35
+        end
+        yawTrack[targetName] = { yaw = yaw, t = now, rate = rate }
+        rotLastRate = math.abs(rate)
+        if rotLastRate < 0.35 then
+                -- deadband: ordinary aim drift / homing wobble is not a curve
+                return Vector3.zero
+        end
+        -- side points to the steerer's LEFT; a left turn (rate > 0) pushes
+        -- the ball toward the steerer's left
+        local side = Vector3.yAxis:Cross(Vector3.new(hx, 0, hz).Unit)
+        local mag = math.clamp(0.4 * rotLastRate * speed, 0, 900)
+        if rate < 0 then mag = -mag end
+        return side * mag
+end
 
 xpcall(function()
 
@@ -1275,7 +1358,7 @@ create("TextLabel", {
 create("TextLabel", {
         Size = UDim2.new(1, -120, 0, 12), Position = UDim2.new(0, 56, 0, 27),
         BackgroundTransparency = 1,
-        Text = "RS26.7 · PREDICT · PERF",
+        Text = "RS26.8 · PREDICT · PERF",
         Font = Enum.Font.GothamBold, TextSize = 8,
         TextColor3 = THEME.TextDim, TextXAlignment = Enum.TextXAlignment.Left,
         Parent = header, ZIndex = 3,
@@ -2014,6 +2097,14 @@ makeStepperRow("PREDICT",
                         or "Predict lead " .. opt, 1.2)
         end)
 
+makeStepperRow("ROTATION",
+        { "ON", "OFF" }, 1,
+        function(i, opt)
+                rotCurveOn = (i == 1)
+                pushStatus(opt == "ON" and "Rotation curve on"
+                        or "Rotation curve off", 1.2)
+        end)
+
 -- ============================================================
 -- [17] LIVE STATS STRIP + DIAGNOSTICS + FOOTER
 -- ============================================================
@@ -2373,6 +2464,15 @@ renderConn = RunService.RenderStepped:Connect(function()
                                         vel = vel, speed = vel.Magnitude,
                                         serverPos = sp, offset = offset,
                                         acc = acc2, -- v26.6: feeds PREDICT extrapolation
+                                        -- v26.8: rotation-led curve prediction,
+                                        -- sampled from the steering player's yaw
+                                        -- ONCE per frame (rotLastRate is set by
+                                        -- the call above — constructor fields
+                                        -- evaluate in order)
+                                        rotAcc = rotCurveAccel(
+                                                ball:GetAttribute("target"),
+                                                vel.Magnitude),
+                                        rotRate = rotLastRate,
                                 }
                                 serverBallDot.Position = sp
                         else
@@ -2498,9 +2598,17 @@ renderConn = RunService.RenderStepped:Connect(function()
                                                 local lead = predictPct
                                                         * getParryTimeOffset()
                                                 if framePhys then
+                                                        -- v26.8: measured acc +
+                                                        -- rotation-led steering acc —
+                                                        -- the steerer's yaw moves
+                                                        -- before the ball's own
+                                                        -- motion shows the curve,
+                                                        -- so the prediction leads
+                                                        -- instead of trails it
                                                         measPos = ball.Position
                                                                 + vel * lead
-                                                                + framePhys.acc
+                                                                + (framePhys.acc
+                                                                        + framePhys.rotAcc)
                                                                         * (lead * lead * 0.5)
                                                 else
                                                         measPos = ball.Position
@@ -2558,7 +2666,20 @@ renderConn = RunService.RenderStepped:Connect(function()
 
                                         if armed and (ttiHit or proxHit)
                                                 and not sameApproach
-                                                and not isCurved(ball, pingSec)
+                                                -- v26.8: the curve veto relaxes only when
+                                                -- the ROTATION predictor is leading the
+                                                -- bend (PREDICT on + opponent yaw rate
+                                                -- >= 1 rad/s) — the predicted path already
+                                                -- accounts for the curve, so a curved ball
+                                                -- can be parried ON TIME instead of
+                                                -- panic-late. Without PREDICT the veto
+                                                -- behaves exactly as before
+                                                and (not isCurved(ball, pingSec)
+                                                        or (rotCurveOn
+                                                                and predictPct > 0
+                                                                and target ~= LocalPlayer.Name
+                                                                and framePhys ~= nil
+                                                                and framePhys.rotRate >= 1.0))
                                                 and os.clock() - lastAutoFireAt >= 0.08 then
                                                 lastAutoFireAt = os.clock()
                                                 -- lockout covers the redirect window:
