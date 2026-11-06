@@ -1,5 +1,5 @@
 -- ============================================================
--- Blade Ball Mobile — BYAKUGAN RS26.9  (Audi RS × iOS 26 Fluid)
+-- Blade Ball Mobile — BYAKUGAN RS27  (Audi RS × iOS 26 Fluid)
 -- ============================================================
 -- UI   : the original RS HUD is back — same Tango Red / Carbon
 --        Audi look, rebuilt with iOS 26 liquid-glass motion:
@@ -146,6 +146,30 @@
 --        · per-engagement cap 14 -> 20; release / post-cap cooldowns
 --          unchanged (0.6 s / 1 s) — an infinite spam on a hovering
 --          ball was redirecting it into us (v26.3 lesson kept)
+-- v27.0 — NEURA NETWORK (new) + SPAM "even faster":
+--        · an 8 -> 6 -> 1 neural network trains LIVE on every
+--          parry outcome. Inputs = the ball's position vs OUR
+--          hitbox position every frame (along-track time, lateral
+--          miss, real distance, vertical offset) + ball speed,
+--          curve (yaw) rate, ping, PREDICT level. Output = a
+--          +-0.12 s timing bias added to the TTI fire window
+--        · supervised by what the SERVER did: the instant the
+--          ball's velocity flips (> 72 deg in one frame — a curve
+--          bends < 5 deg/frame) the redirect has landed; label =
+--          fire - resolve + 2 x ping (the packet must arrive ~one
+--          ping BEFORE server impact, the redirect is seen ~one
+--          ping after). Late parries widen the window, early
+--          parries narrow it — one SGD step per resolved approach
+--        · zero-init output = exact no-op until samples exist;
+--          converges to YOUR device latency after ~10-20
+--          approaches. Spam shots are never trained on (saturation
+--          timing is by design, not a timing signal)
+--        · spam retune ("even faster"): fire rate 0.04 -> 0.02 s
+--          (~50 packets/s), engagement cap 20 -> 30 (same 0.6 s
+--          saturation envelope, double the density); <= 10 stud
+--          engage / 14 release / hover-ball cooldowns unchanged
+--        · new NEURA stepper (ON/OFF, default ON; OFF = exact
+--          v26.9 behavior)
 -- ============================================================
 
 -- ============================================================
@@ -310,6 +334,173 @@ local function rotCurveAccel(targetName, speed)
         local mag = math.clamp(0.4 * rotLastRate * speed, 0, 900)
         if rate < 0 then mag = -mag end
         return side * mag
+end
+
+-- ============================================================
+-- v27.0 NEURA — a tiny online-trained neural net (8 -> 6 -> 1,
+-- tanh) that learns YOUR parry timing from live outcomes.
+-- Inputs = ball position vs OUR hitbox position, every frame:
+-- along-track time, lateral miss, real distance, vertical offset,
+-- ball speed, curve (yaw) rate, ping, PREDICT level. Output = a
+-- +-0.12 s timing bias ADDED to the TTI fire window.
+-- Training: every fired approach is observed until the server's
+-- answer replicates — an instant velocity flip (> 72 deg/frame;
+-- a curve bends < 5 deg/frame) is the redirect landing (parry
+-- ON TIME), otherwise the closest approach is the impact. Label
+-- = fire - resolve + 2 x ping (the packet must arrive ~one ping
+-- BEFORE server impact and the redirect is seen ~one ping after),
+-- then one SGD step (lr 0.2, loss on the normalized target so the
+-- 0.12 s output scale never shrinks the gradient). Late parries widen the window,
+-- early parries narrow it. Zero-init output = exact no-op until
+-- samples exist; ~10-20 approaches to converge on a device.
+-- ALL state lives in the main chunk: the xpcall body sits at the
+-- 200-local compiler limit, so the body only calls neuraBias /
+-- neuraObserve and tags fires with the pending sample.
+-- ============================================================
+local neuraOn = true
+local neuraPending = nil -- this frame's NN inputs (attached at fire)
+local neuraSession = nil -- the fired approach being observed
+local neuraStats = { n = 0, err = 0 }
+local nnW1, nnB1, nnW2, nnB2 = {}, {}, {}, {}
+for j = 1, 6 do
+        local row = {}
+        for i = 1, 8 do
+                row[i] = ((i + j) % 2 == 0) and 0.5 or -0.5
+        end
+        nnW1[j] = row
+        nnB1[j] = 0
+        nnW2[j] = 0 -- zero output head: EXACT no-op until first sample
+end
+nnB2[1] = 0
+
+local function neuraFwd(x)
+        local h = {}
+        for j = 1, 6 do
+                local w, z = nnW1[j], nnB1[j]
+                for i = 1, 8 do z = z + w[i] * x[i] end
+                h[j] = math.tanh(z)
+        end
+        local z2 = nnB2[1]
+        for j = 1, 6 do z2 = z2 + nnW2[j] * h[j] end
+        return math.tanh(z2), h
+end
+
+-- timing bias (seconds) for the CURRENT geometry; runs every
+-- frame the fire window is computed and stores the sample that a
+-- fire this frame would train on
+local function neuraBias(root, ball, framePhys, vel, speed,
+                tti, lateral, pingSec)
+        if not neuraOn then
+                neuraPending = nil -- no stale samples while OFF
+                return 0
+        end
+        local bp, rp = ball and ball.Position, root and root.Position
+        if not bp or not rp then return 0 end
+        local x = {
+                math.clamp(tti * 0.5, 0, 1.5),
+                math.clamp(lateral / 12, 0, 3),
+                math.clamp(speed / 200, 0, 5),
+                math.clamp((bp - rp).Magnitude / 100, 0, 5),
+                math.clamp((framePhys and framePhys.rotRate
+                        or 0) / 3, 0, 1.5),
+                math.clamp(pingSec * 5, 0, 1.5),
+                math.clamp((rp.Y - bp.Y) / 50, -1.5, 1.5),
+                predictPct,
+        }
+        local y = neuraFwd(x)
+        neuraPending = { x = x, at = os.clock(), ping = pingSec,
+                speed = speed }
+        return 0.12 * y
+end
+
+local function neuraTrain(s, tResolve)
+        local label = s.at - tResolve + 2 * s.ping
+        if label > 0.12 then label = 0.12
+        elseif label < -0.12 then label = -0.12 end
+        local y, h = neuraFwd(s.x)
+        -- loss on the NORMALIZED target: label/0.12 is in [-1, 1],
+        -- the same range tanh outputs — full-size gradients
+        local dOut = (y - label / 0.12) * (1 - y * y)
+        local dh = {}
+        for j = 1, 6 do
+                dh[j] = (1 - h[j] * h[j]) * nnW2[j] * dOut
+        end
+        for j = 1, 6 do
+                nnW2[j] = math.clamp(nnW2[j] - 0.2 * dOut * h[j], -3, 3)
+        end
+        nnB2[1] = math.clamp(nnB2[1] - 0.2 * dOut, -3, 3)
+        for j = 1, 6 do
+                local w, g = nnW1[j], 0.2 * dh[j]
+                for i = 1, 8 do
+                        w[i] = math.clamp(w[i] - g * s.x[i], -3, 3)
+                end
+                nnB1[j] = math.clamp(nnB1[j] - g, -3, 3)
+        end
+        neuraStats.n = neuraStats.n + 1
+        neuraStats.err = neuraStats.err + math.abs(0.12 * y - label)
+end
+
+-- per-frame observer: arms from the last TTI/PANIC fire (spam
+-- shots carry no sample — saturation timing is by design, not a
+-- timing signal), resolves the approach, trains once
+local neuraMe = nil
+local function neuraObserve(ball, root, framePhys)
+        if not neuraOn or not root then
+                neuraSession = nil
+                return
+        end
+        local s = neuraSession
+        if not s then
+                local fi = lastFireInfo
+                if fi and fi.nn and fi.ball == ball
+                        and fi.nn.speed and fi.nn.speed > 20
+                        and not fi.nnSeen then
+                        fi.nnSeen = true
+                        if not neuraMe then
+                                neuraMe = game:GetService("Players")
+                                        .LocalPlayer.Name
+                        end
+                        neuraSession = { ball = ball, x = fi.nn.x,
+                                at = fi.nn.at, ping = fi.nn.ping,
+                                minD = math.huge, tMin = 0,
+                                dir = framePhys and framePhys.vel
+                                        and framePhys.vel.Unit or nil }
+                end
+                return
+        end
+        if ball ~= s.ball then
+                -- ball despawned / next round: resolve from what we saw
+                if s.minD < 15 then neuraTrain(s, s.tMin) end
+                neuraSession = nil
+                return
+        end
+        local v = framePhys and framePhys.vel or nil
+        if not v then
+                local ok, av = pcall(function()
+                        local z = ball:FindFirstChild("zoomies")
+                        return z and z.VectorVelocity
+                                or ball.AssemblyLinearVelocity
+                end)
+                if ok then v = av end
+        end
+        if not v or v.Magnitude < 1 then return end
+        local dir = v.Unit
+        if s.dir and s.dir:Dot(dir) < 0.3 then
+                -- instant flip = the server redirect landed NOW
+                neuraTrain(s, os.clock())
+                neuraSession = nil
+                return
+        end
+        s.dir = dir
+        local d = (ball.Position - root.Position).Magnitude
+        if d < s.minD then
+                s.minD = d
+                s.tMin = os.clock()
+        end
+        if os.clock() - s.at > 3 then
+                if s.minD < 15 then neuraTrain(s, s.tMin) end
+                neuraSession = nil
+        end
 end
 
 xpcall(function()
@@ -1370,7 +1561,7 @@ create("TextLabel", {
 create("TextLabel", {
         Size = UDim2.new(1, -120, 0, 12), Position = UDim2.new(0, 56, 0, 27),
         BackgroundTransparency = 1,
-        Text = "RS26.9 · PREDICT · PERF",
+        Text = "RS27 · NEURA · PREDICT · PERF",
         Font = Enum.Font.GothamBold, TextSize = 8,
         TextColor3 = THEME.TextDim, TextXAlignment = Enum.TextXAlignment.Left,
         Parent = header, ZIndex = 3,
@@ -2117,6 +2308,14 @@ makeStepperRow("ROTATION",
                         or "Rotation curve off", 1.2)
         end)
 
+makeStepperRow("NEURA",
+        { "ON", "OFF" }, 1,
+        function(i, opt)
+                neuraOn = (i == 1)
+                pushStatus(opt == "ON" and "Neura net on — learning live"
+                        or "Neura net off", 1.2)
+        end)
+
 -- ============================================================
 -- [17] LIVE STATS STRIP + DIAGNOSTICS + FOOTER
 -- ============================================================
@@ -2496,6 +2695,9 @@ renderConn = RunService.RenderStepped:Connect(function()
                         serverBallDot.Position = Vector3.new(0, -100, 0)
                 end
 
+                -- v27.0 NEURA: observe/train the fired approach
+                neuraObserve(ball, root, framePhys)
+
                 -- ===== AUTO SPAM (v26.9 — proximity-only) =====
                 -- v26.9: engages on PURE PROXIMITY — the ball within 10
                 -- studs of US, regardless of who it is targeting (the
@@ -2529,10 +2731,11 @@ renderConn = RunService.RenderStepped:Connect(function()
                         spamActive = false
                         spamCooldownUntil = os.clock() + 0.6
                 end
-                -- fires: 0.04 s throttle (~25/s) + cap 20 per engagement
-                if spamActive and spamFires < 20
-                        and os.clock() - lastSpamAt >= 0.04
-                        and os.clock() - lastAutoFireAt >= 0.04 then
+                -- fires: 0.02 s throttle (~50/s) + cap 30 per engagement
+                -- (v27.0 "even faster": same 0.6 s envelope, double density)
+                if spamActive and spamFires < 30
+                        and os.clock() - lastSpamAt >= 0.02
+                        and os.clock() - lastAutoFireAt >= 0.02 then
                         lastSpamAt = os.clock()
                         lastAutoFireAt = os.clock()
                         -- v26.7: spam shots also arm the anti-double gate,
@@ -2544,7 +2747,7 @@ renderConn = RunService.RenderStepped:Connect(function()
                         if fireParryRemote(getCurveCFrame()) then
                                 spamFireCount = spamFireCount + 1
                                 spamFires = spamFires + 1
-                                if spamFires >= 20 then
+                                if spamFires >= 30 then
                                         spamActive = false
                                         spamCooldownUntil = os.clock() + 1
                                 end
@@ -2630,7 +2833,15 @@ renderConn = RunService.RenderStepped:Connect(function()
                                                         lateral = (rel - dir * along).Magnitude
                                                 end
                                         end
+                                        -- v27.0 NEURA: learned +-0.12 s
+                                        -- timing bias on the fire window;
+                                        -- exactly 0 until the net has live
+                                        -- outcome samples (zero-init)
                                         local fireTti = ttiFireWindow(speed)
+                                                + neuraBias(root, ball,
+                                                        framePhys, vel,
+                                                        speed, tti, lateral,
+                                                        pingSec)
                                         local hitRadius = math.max(accuracy * 0.55, 12)
                                         local ttiHit = tti <= fireTti and lateral <= hitRadius
                                         -- proximity fallback — v26.4: REAL distance only.
@@ -2694,7 +2905,8 @@ renderConn = RunService.RenderStepped:Connect(function()
                                                                 pingSec * 2 + 0.06)
                                                 parryRetries = math.min(parryRetries + 1, 4)
                                                 lastFireInfo = { ball = ball, t = os.clock(),
-                                                        vel = vel, target = target }
+                                                        vel = vel, target = target,
+                                                        nn = neuraPending }
                                                 lastTtiBucket = -1
                                                 fxBurst()
                                                 fireSelected()
@@ -2709,7 +2921,8 @@ renderConn = RunService.RenderStepped:Connect(function()
                                                         + parryCooldown(speed) * 0.6
                                                 parryRetries = parryRetries + 1
                                                 lastFireInfo = { ball = ball, t = os.clock(),
-                                                        vel = vel, target = target }
+                                                        vel = vel, target = target,
+                                                        nn = neuraPending }
                                                 lastTtiBucket = -1
                                                 fxBurst()
                                                 fireSelected()
