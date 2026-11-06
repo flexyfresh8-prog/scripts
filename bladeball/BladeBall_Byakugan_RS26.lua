@@ -1,5 +1,5 @@
 -- ============================================================
--- Blade Ball Mobile — BYAKUGAN RS26.8  (Audi RS × iOS 26 Fluid)
+-- Blade Ball Mobile — BYAKUGAN RS26.9  (Audi RS × iOS 26 Fluid)
 -- ============================================================
 -- UI   : the original RS HUD is back — same Tango Red / Carbon
 --        Audi look, rebuilt with iOS 26 liquid-glass motion:
@@ -33,9 +33,10 @@
 --           ball is about to connect — a wasted early fire no
 --           longer means death.
 -- AUTO SPAM:
---        distance(ball -> its target) <= 15 studs  ->  spam
---        ENGAGES (rapid hook-replay fires) and releases above
---        22 studs (hysteresis, no flicker).
+--        proximity-only: the ball within 10 studs of YOU -> spam
+--        ENGAGES (rapid hook-replay fires, 0.04 s apart) and
+--        releases above 14 studs (hysteresis, no flicker) —
+--        regardless of who the ball is targeting.
 -- Boot-safety: UI builds FIRST, no infinite waits, every error
 --        shows a visible red panel instead of silent death.
 -- v26.2 — SMOOTH + MINIMAL:
@@ -134,6 +135,17 @@
 --          Without PREDICT the veto behaves exactly as before
 --        · new ROTATION stepper (ON/OFF, default ON — dormant until
 --          PREDICT is on)
+-- v26.9 — SPAM OVERHAUL (tuned):
+--        · proximity-only engage: the ball within 10 studs of YOU,
+--          regardless of who it is targeting — the target attribute
+--          flickers nil mid-flight and gating on it let close balls
+--          slip through unspammed (hysteresis release at 14 studs)
+--        · fire rate 0.09 -> 0.04 s (~25 packets/s): spam exists to
+--          saturate the server's validation window — an 11/s trickle
+--          missed it on laggy frames
+--        · per-engagement cap 14 -> 20; release / post-cap cooldowns
+--          unchanged (0.6 s / 1 s) — an infinite spam on a hovering
+--          ball was redirecting it into us (v26.3 lesson kept)
 -- ============================================================
 
 -- ============================================================
@@ -1358,7 +1370,7 @@ create("TextLabel", {
 create("TextLabel", {
         Size = UDim2.new(1, -120, 0, 12), Position = UDim2.new(0, 56, 0, 27),
         BackgroundTransparency = 1,
-        Text = "RS26.8 · PREDICT · PERF",
+        Text = "RS26.9 · PREDICT · PERF",
         Font = Enum.Font.GothamBold, TextSize = 8,
         TextColor3 = THEME.TextDim, TextXAlignment = Enum.TextXAlignment.Left,
         Parent = header, ZIndex = 3,
@@ -2045,7 +2057,7 @@ makeSwitchRow("AUTO PARRY", isRunning, function(v)
         pushStatus(v and "Parry on" or "Parry off", 1)
 end)
 
-makeSwitchRow("AUTO SPAM <15", autoSpamEnabled, function(v)
+makeSwitchRow("AUTO SPAM <10", autoSpamEnabled, function(v)
         autoSpamEnabled = v
         if not v then spamActive = false end
         pushStatus(v and "Auto spam armed" or "Auto spam off", 1.2)
@@ -2484,50 +2496,43 @@ renderConn = RunService.RenderStepped:Connect(function()
                         serverBallDot.Position = Vector3.new(0, -100, 0)
                 end
 
-                -- ===== AUTO SPAM (v26.3 — survival-gated) =====
-                -- Spam engages ONLY when the ball is actually coming TO US
-                -- (target == me) and is within 15 studs. Fires are capped
-                -- per engagement and throttled — an infinite 66/s spam on
-                -- a passing/hovering ball was redirecting it into us and
-                -- getting us killed.
-                if autoSpamEnabled and ball
+                -- ===== AUTO SPAM (v26.9 — proximity-only) =====
+                -- v26.9: engages on PURE PROXIMITY — the ball within 10
+                -- studs of US, regardless of who it is targeting (the
+                -- target attribute flickers nil mid-flight and a gate on
+                -- it let close balls through unspammed). Rate raised
+                -- 0.09 -> 0.04 s (~25 packets/s): spam exists to saturate
+                -- the server's validation window, an 11/s trickle didn't.
+                -- Still capped per engagement + release-gated — an
+                -- infinite spam on a hovering ball was redirecting it
+                -- into us and getting us killed (v26.3 lesson kept).
+                if autoSpamEnabled and ball and root
                         and not deathActive and not infActive then
-                        local spamTarget = ball:GetAttribute("target")
-                        local _, tRoot = ballTargetPlayer(ball)
-                        local comingToMe = spamTarget == LocalPlayer.Name
-                                and tRoot ~= nil
-                        local protected = root ~= nil
-                                and (root:FindFirstChild("SingularityCape") ~= nil
-                                        or ball:FindFirstChild("ComboCounter") ~= nil)
-                        if comingToMe then
-                                local targetDist = (tRoot.Position - ball.Position).Magnitude
-                                if not spamActive
-                                        and os.clock() >= spamCooldownUntil
-                                        and targetDist <= 15 and not protected then
+                        local distUs = (root.Position - ball.Position).Magnitude
+                        local protected = root:FindFirstChild("SingularityCape") ~= nil
+                                or ball:FindFirstChild("ComboCounter") ~= nil
+                        if not spamActive then
+                                if os.clock() >= spamCooldownUntil
+                                        and distUs <= 10 and not protected then
                                         spamActive = true
                                         spamFires = 0
                                         pushStatus("SPAM ENGAGED", 1.4)
                                         islandPop(1.25)
                                         fxBurst()
-                                elseif spamActive
-                                        and (targetDist > 22 or protected) then
-                                        spamActive = false
-                                        spamCooldownUntil = os.clock() + 0.6
-                                        pushStatus("Spam released", 0.8)
                                 end
-                        elseif spamActive then
-                                -- ball went to someone else -> stop instantly
+                        elseif distUs > 14 or protected then
                                 spamActive = false
                                 spamCooldownUntil = os.clock() + 0.6
+                                pushStatus("Spam released", 0.8)
                         end
                 elseif spamActive then
                         spamActive = false
                         spamCooldownUntil = os.clock() + 0.6
                 end
-                -- fires: 0.09 s throttle + hard cap 14 per engagement
-                if spamActive and spamFires < 14
-                        and os.clock() - lastSpamAt >= 0.09
-                        and os.clock() - lastAutoFireAt >= 0.09 then
+                -- fires: 0.04 s throttle (~25/s) + cap 20 per engagement
+                if spamActive and spamFires < 20
+                        and os.clock() - lastSpamAt >= 0.04
+                        and os.clock() - lastAutoFireAt >= 0.04 then
                         lastSpamAt = os.clock()
                         lastAutoFireAt = os.clock()
                         -- v26.7: spam shots also arm the anti-double gate,
@@ -2539,7 +2544,7 @@ renderConn = RunService.RenderStepped:Connect(function()
                         if fireParryRemote(getCurveCFrame()) then
                                 spamFireCount = spamFireCount + 1
                                 spamFires = spamFires + 1
-                                if spamFires >= 14 then
+                                if spamFires >= 20 then
                                         spamActive = false
                                         spamCooldownUntil = os.clock() + 1
                                 end
