@@ -1,5 +1,5 @@
 -- ============================================================
--- Blade Ball Mobile — BYAKUGAN RS26.6  (Audi RS × iOS 26 Fluid)
+-- Blade Ball Mobile — BYAKUGAN RS26.7  (Audi RS × iOS 26 Fluid)
 -- ============================================================
 -- UI   : the original RS HUD is back — same Tango Red / Carbon
 --        Audi look, rebuilt with iOS 26 liquid-glass motion:
@@ -92,6 +92,23 @@
 --          lead lives on the measurement side only, so the v26.4
 --          double-count can never come back
 --        · default OFF — current timing unchanged until you dial it in
+-- v26.7 — ANTI-DOUBLE-PARRY (fix):
+--        · the trigger could fire a SECOND packet on the same approach:
+--          parryCooldown is only 0.14 s on fast balls, but the server's
+--          "ball parried away" redirect takes 1-2 x ping (0.1-0.3 s) to
+--          replicate — until it arrives the ball still reads as incoming
+--          and targeting us, so TTI (no per-approach cap!) or PANIC
+--          fired again. The wasted packet starts the game's parry
+--          cooldown right before the real contact -> dead
+--        · TTI branch now fires ONCE per approach: a refire needs the
+--          ball state to actually CHANGE (redirect / curve / new target
+--          / spam shot in between) — a stale incoming ball can no
+--          longer re-trigger it
+--        · post-fire lockout now covers replication: max(cooldown,
+--          2 x ping + 0.06) — PANIC opens only after the redirect had
+--          its chance to arrive, so a true miss still gets the last-
+--          chance refire (retries <= 4 unchanged), a saved approach
+--          stays silent
 -- ============================================================
 
 -- ============================================================
@@ -189,6 +206,12 @@ end
 -- (PUC Lua and Luau both cap a function scope at 200), so this new
 -- state must live out here and ride INTO the script as an upvalue.
 local predictPct = 0 -- 0 = OFF; else lead fraction (0.25 / 0.5 / 0.75 / 1) of the parry offset
+-- v26.7 anti-double-parry state — main chunk on purpose (the xpcall
+-- body below is AT the 200-active-local compiler limit, so new state
+-- rides in as an upvalue). Snapshot of the last auto fire: firing
+-- again on the SAME ball with UNCHANGED target and velocity is a
+-- wasted double — the redirect packet just hasn't replicated yet.
+local lastFireInfo = nil
 
 xpcall(function()
 
@@ -1248,7 +1271,7 @@ create("TextLabel", {
 create("TextLabel", {
         Size = UDim2.new(1, -120, 0, 12), Position = UDim2.new(0, 56, 0, 27),
         BackgroundTransparency = 1,
-        Text = "RS26.6 · PREDICT · PERF",
+        Text = "RS26.7 · PREDICT · PERF",
         Font = Enum.Font.GothamBold, TextSize = 8,
         TextColor3 = THEME.TextDim, TextXAlignment = Enum.TextXAlignment.Left,
         Parent = header, ZIndex = 3,
@@ -2396,6 +2419,12 @@ renderConn = RunService.RenderStepped:Connect(function()
                         and os.clock() - lastAutoFireAt >= 0.09 then
                         lastSpamAt = os.clock()
                         lastAutoFireAt = os.clock()
+                        -- v26.7: spam shots also arm the anti-double gate,
+                        -- so the TTI branch cannot stack a wasted packet
+                        -- on top of an engagement that is already firing
+                        lastFireInfo = { ball = ball, t = os.clock(),
+                                vel = ballVelocity(ball),
+                                target = ball:GetAttribute("target") }
                         if fireParryRemote(getCurveCFrame()) then
                                 spamFireCount = spamFireCount + 1
                                 spamFires = spamFires + 1
@@ -2502,12 +2531,33 @@ renderConn = RunService.RenderStepped:Connect(function()
                                                 and target == LocalPlayer.Name
                                                 and not blocked
 
+                                        -- v26.7 ANTI-DOUBLE-PARRY: after an auto fire
+                                        -- the ball state is STALE for ~2 x ping (the
+                                        -- redirect hasn't replicated). Same ball +
+                                        -- same target + same velocity = the SAME
+                                        -- approach: the TTI branch must not fire
+                                        -- again on it — that second packet is the
+                                        -- wasted double that starts the game's parry
+                                        -- cooldown right before contact. Re-fires go
+                                        -- through PANIC only (last chance, capped).
+                                        local sameApproach = lastFireInfo ~= nil
+                                                and lastFireInfo.ball == ball
+                                                and target == lastFireInfo.target
+                                                and (vel - lastFireInfo.vel).Magnitude <= 6
+
                                         if armed and (ttiHit or proxHit)
+                                                and not sameApproach
                                                 and not isCurved(ball, pingSec)
                                                 and os.clock() - lastAutoFireAt >= 0.08 then
                                                 lastAutoFireAt = os.clock()
-                                                parriedUntil = os.clock() + parryCooldown(speed)
+                                                -- lockout covers the redirect window:
+                                                -- max(speed cooldown, 2 x ping + 0.06)
+                                                parriedUntil = os.clock()
+                                                        + math.max(parryCooldown(speed),
+                                                                pingSec * 2 + 0.06)
                                                 parryRetries = math.min(parryRetries + 1, 4)
+                                                lastFireInfo = { ball = ball, t = os.clock(),
+                                                        vel = vel, target = target }
                                                 lastTtiBucket = -1
                                                 fxBurst()
                                                 fireSelected()
@@ -2521,6 +2571,8 @@ renderConn = RunService.RenderStepped:Connect(function()
                                                 parriedUntil = os.clock()
                                                         + parryCooldown(speed) * 0.6
                                                 parryRetries = parryRetries + 1
+                                                lastFireInfo = { ball = ball, t = os.clock(),
+                                                        vel = vel, target = target }
                                                 lastTtiBucket = -1
                                                 fxBurst()
                                                 fireSelected()
