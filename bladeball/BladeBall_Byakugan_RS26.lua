@@ -1,5 +1,5 @@
 -- ============================================================
--- Blade Ball Mobile — BYAKUGAN RS27.1  (Audi RS × iOS 26 Fluid)
+-- Blade Ball Mobile — BYAKUGAN RS27.2  (Audi RS × iOS 26 Fluid)
 -- ============================================================
 -- UI   : the original RS HUD is back — same Tango Red / Carbon
 --        Audi look, rebuilt with iOS 26 liquid-glass motion:
@@ -29,13 +29,13 @@
 --        3. Curve-veto cap: other players' parries can only
 --           block your parry max 1.2 s, no matter the range.
 --        4. Adaptive cooldown: 0.72 s at slow balls down to
---           0.16 s at 800+ studs/s, plus PANIC refire when the
---           ball is about to connect — a wasted early fire no
---           longer means death.
+--           0.16 s at 800+ studs/s — and NO panic refire: the
+--           TTI branch fires exactly ONCE per approach, a
+--           second packet is how doubles happened (v27.2).
 -- AUTO SPAM:
---        proximity-only: the ball within 10 studs of YOU -> spam
---        ENGAGES (rapid hook-replay fires, 0.04 s apart) and
---        releases above 14 studs (hysteresis, no flicker) —
+--        proximity-only: the ball within 13 studs of YOU -> spam
+--        ENGAGES (rapid hook-replay fires, 0.03 s apart) and
+--        releases above 16 studs (hysteresis, no flicker) —
 --        regardless of who the ball is targeting.
 -- Boot-safety: UI builds FIRST, no infinite waits, every error
 --        shows a visible red panel instead of silent death.
@@ -190,6 +190,27 @@
 --          game's parry cooldown on a wasted packet
 --        · a target change re-arms everything (lastFireInfo cleared
 --          + flip latch reset) — 1v1 rallies keep working
+-- v27.2 — PANIC REMOVED + SPAM RETUNE (user diagnosis):
+--        · the last double was a FAST CURVE. Not the curve
+--          predictor — PANIC itself: on a hard curve the ball's
+--          velocity can flip in STEPS (the steerer re-aims
+--          mid-flight), the v27.1 dot < 0.3 latch can read those
+--          steps as steering and miss the true redirect, the
+--          lockout then expires while the ball still reads
+--          incoming, and PANIC — whose trigger (tti <= HALF the
+--          window, lateral <= 1.5x radius) is EXACTLY a fast
+--          curve's signature — fired the SECOND packet
+--        · PANIC is removed ENTIRELY. It was the only branch that
+--          could ever fire twice on one approach, so a targeting
+--          double is now structurally impossible: TTI = exactly
+--          one packet per approach (v27.1 gate), spam = its own
+--          proximity system (by design multi-fire, never gated)
+--        · a true miss now recovers via AUTO SPAM: engage 10 ->
+--          13 studs (release 14 -> 16, hysteresis kept) — a
+--          wider net replaces the panic backstop
+--        · spam "a bit too fast": throttle 0.02 -> 0.03 s
+--          (~50 -> ~33 packets/s), cap 30 kept — the saturation
+--          envelope stretches 0.6 -> 0.9 s
 -- ============================================================
 
 -- ============================================================
@@ -460,7 +481,7 @@ local function neuraTrain(s, tResolve)
         neuraStats.err = neuraStats.err + math.abs(0.12 * y - label)
 end
 
--- per-frame observer: arms from the last TTI/PANIC fire (spam
+-- per-frame observer: arms from the last TTI fire (spam
 -- shots carry no sample — saturation timing is by design, not a
 -- timing signal), resolves the approach, trains once
 local neuraMe = nil
@@ -531,48 +552,15 @@ end
 -- and the gate dissolved long before the server's redirect had
 -- its chance to arrive (2 x ping). After that the TTI branch was
 -- free to fire a SECOND packet on the same approach — the double
--- the user still saw. The watcher now latches the ONE event that
--- truly ends an approach: an instant direction flip (dot < 0.3
--- between consecutive frames — a curve bends < 5 deg/frame, a
--- redirect is 90+ deg at once). TTI then fires exactly ONCE per
+-- the user still saw. The TTI branch now fires exactly ONCE per
 -- approach: release only on target change / new ball / 1.2 s
--- failsafe. PANIC stays open for true misses (no flip) but is
--- BLOCKED the moment a flip is seen, so a deflected ball can no
--- longer bait a wasted packet into the game's parry cooldown.
--- Same main-chunk rule as NEURA: the xpcall body is at the
--- 200-local limit and only calls these functions.
+-- failsafe (the sameApproach gate in the monitor loop).
+-- v27.2: the per-frame flip watcher this block used to host is
+-- GONE together with PANIC — its only reader WAS the PANIC gate
+-- (block a refire once the redirect was seen), and NEURA's
+-- observer latches that same flip on its own for training. One
+-- less per-frame scan, six fewer main-chunk locals.
 -- ============================================================
-local apBall, apDir, apFlipAt = nil, nil, nil
-local function watchApproach(ball, framePhys)
-        if ball ~= apBall then
-                apBall, apDir, apFlipAt = ball, nil, nil
-        end
-        if not ball then return end
-        local vel = framePhys and framePhys.vel
-        if not vel or vel.Magnitude < 1 then
-                local ok, v = pcall(function()
-                        local z = ball:FindFirstChild("zoomies")
-                        return z and z.VectorVelocity
-                                or ball.AssemblyLinearVelocity
-                end)
-                if ok and v and v.Magnitude > 1 then vel = v end
-        end
-        if not vel or vel.Magnitude < 1 then return end
-        local dir = vel.Unit
-        if apDir and not apFlipAt and apDir:Dot(dir) < 0.3 then
-                apFlipAt = os.clock()
-        end
-        apDir = dir
-end
-local function approachResolvedSince(ball, t)
-        return apBall == ball and apFlipAt ~= nil and apFlipAt >= t
-end
-local function watchReset(ball)
-        if apBall == ball then
-                apFlipAt = nil
-                apDir = nil
-        end
-end
 
 xpcall(function()
 
@@ -634,7 +622,6 @@ local spamFires      = 0             -- fires in the CURRENT engagement
 local spamCooldownUntil = 0          -- re-arm delay between engagements
 local lastAutoFireAt = 0             -- shared throttle: ANY auto fire
 local parriedUntil   = 0
-local parryRetries   = 0
 local lastTtiBucket  = -1        -- anti-garbage TTI text bucket
 local lastTargetOf   = {}
 local deathActive    = false
@@ -1137,9 +1124,8 @@ local function ttiFireWindow(speed)
         return math.clamp(w, 0.08, 0.42)
 end
 
--- Adaptive cooldown: fast balls re-arm FAST so a wasted early
--- fire can be corrected before contact; slow balls stay quiet.
--- (Guaranteed shorter than the panic window: refire is reachable.)
+-- Adaptive cooldown: fast balls re-arm FAST so the next
+-- approach after a redirect is covered; slow balls stay quiet.
 local function parryCooldown(speed)
         return math.clamp(0.5 - speed / 1600, 0.14, 0.5)
 end
@@ -1632,7 +1618,7 @@ create("TextLabel", {
 create("TextLabel", {
         Size = UDim2.new(1, -120, 0, 12), Position = UDim2.new(0, 56, 0, 27),
         BackgroundTransparency = 1,
-        Text = "RS27.1 · NEURA · PREDICT · PERF",
+        Text = "RS27.2 · NEURA · PREDICT · PERF",
         Font = Enum.Font.GothamBold, TextSize = 8,
         TextColor3 = THEME.TextDim, TextXAlignment = Enum.TextXAlignment.Left,
         Parent = header, ZIndex = 3,
@@ -2319,7 +2305,7 @@ makeSwitchRow("AUTO PARRY", isRunning, function(v)
         pushStatus(v and "Parry on" or "Parry off", 1)
 end)
 
-makeSwitchRow("AUTO SPAM <10", autoSpamEnabled, function(v)
+makeSwitchRow("AUTO SPAM <13", autoSpamEnabled, function(v)
         autoSpamEnabled = v
         if not v then spamActive = false end
         pushStatus(v and "Auto spam armed" or "Auto spam off", 1.2)
@@ -2768,19 +2754,19 @@ renderConn = RunService.RenderStepped:Connect(function()
 
                 -- v27.0 NEURA: observe/train the fired approach
                 neuraObserve(ball, root, framePhys)
-                -- v27.1: latch the approach-ending redirect flip
-                watchApproach(ball, framePhys)
 
                 -- ===== AUTO SPAM (v26.9 — proximity-only) =====
-                -- v26.9: engages on PURE PROXIMITY — the ball within 10
-                -- studs of US, regardless of who it is targeting (the
-                -- target attribute flickers nil mid-flight and a gate on
-                -- it let close balls through unspammed). Rate raised
-                -- 0.09 -> 0.04 s (~25 packets/s): spam exists to saturate
-                -- the server's validation window, an 11/s trickle didn't.
-                -- Still capped per engagement + release-gated — an
-                -- infinite spam on a hovering ball was redirecting it
-                -- into us and getting us killed (v26.3 lesson kept).
+                -- v26.9: engages on PURE PROXIMITY — the ball close to
+                -- US, regardless of who it is targeting (the target
+                -- attribute flickers nil mid-flight and a gate on it
+                -- let close balls through unspammed). Still capped per
+                -- engagement + release-gated — an infinite spam on a
+                -- hovering ball was redirecting it into us and getting
+                -- us killed (v26.3 lesson kept).
+                -- v27.2: engage 10 -> 13 studs, release 14 -> 16
+                -- (hysteresis kept) — with PANIC gone, spam is also
+                -- the safety net for a missed TTI fire, so the
+                -- window grows.
                 if autoSpamEnabled and ball and root
                         and not deathActive and not infActive then
                         local distUs = (root.Position - ball.Position).Magnitude
@@ -2788,14 +2774,14 @@ renderConn = RunService.RenderStepped:Connect(function()
                                 or ball:FindFirstChild("ComboCounter") ~= nil
                         if not spamActive then
                                 if os.clock() >= spamCooldownUntil
-                                        and distUs <= 10 and not protected then
+                                        and distUs <= 13 and not protected then
                                         spamActive = true
                                         spamFires = 0
                                         pushStatus("SPAM ENGAGED", 1.4)
                                         islandPop(1.25)
                                         fxBurst()
                                 end
-                        elseif distUs > 14 or protected then
+                        elseif distUs > 16 or protected then
                                 spamActive = false
                                 spamCooldownUntil = os.clock() + 0.6
                                 pushStatus("Spam released", 0.8)
@@ -2804,11 +2790,12 @@ renderConn = RunService.RenderStepped:Connect(function()
                         spamActive = false
                         spamCooldownUntil = os.clock() + 0.6
                 end
-                -- fires: 0.02 s throttle (~50/s) + cap 30 per engagement
-                -- (v27.0 "even faster": same 0.6 s envelope, double density)
+                -- fires: 0.03 s throttle (~33/s) + cap 30 per engagement
+                -- (v27.2 "a bit too fast": 0.02 -> 0.03 s, cap kept —
+                -- the saturation envelope stretches 0.6 -> 0.9 s)
                 if spamActive and spamFires < 30
-                        and os.clock() - lastSpamAt >= 0.02
-                        and os.clock() - lastAutoFireAt >= 0.02 then
+                        and os.clock() - lastSpamAt >= 0.03
+                        and os.clock() - lastAutoFireAt >= 0.03 then
                         lastSpamAt = os.clock()
                         lastAutoFireAt = os.clock()
                         -- v26.7: spam shots also arm the anti-double gate,
@@ -2840,14 +2827,11 @@ renderConn = RunService.RenderStepped:Connect(function()
                                                 and lastTargetOf[ball] ~= target then
                                                 lastTargetOf[ball] = target
                                                 parriedUntil = 0
-                                                parryRetries = 0
                                                 lastTtiBucket = -1
                                                 -- v27.1: a target change ENDS the
                                                 -- approach — the once-per-approach
-                                                -- gate and the flip latch re-arm for
-                                                -- the next exchange
+                                                -- gate re-arms for the next exchange
                                                 lastFireInfo = nil
-                                                watchReset(ball)
                                         end
                                         local speed, serverPos
                                         if framePhys then
@@ -2932,12 +2916,17 @@ renderConn = RunService.RenderStepped:Connect(function()
                                                 or distReal
                                         local proxHit = nearDist <= accuracy
                                                 and (speed < 140 or nearDist < 70)
-                                        -- PANIC: contact in the last ~half of the send
-                                        -- lead (~0.13 s) — curve veto ignored
-                                        -- (v26.3: lateral tightened — panicking at balls
-                                        -- passing far to the side was a kill-risk)
-                                        local panic = tti <= fireTti * 0.5
-                                                and lateral <= hitRadius * 1.5
+                                        -- v27.2: PANIC refire REMOVED. On a fast
+                                        -- curve the redirect can flip in steps the
+                                        -- dot < 0.3 latch reads as steering, the
+                                        -- lockout expired while the ball still read
+                                        -- incoming, and PANIC — whose trigger
+                                        -- (tti <= half window, lateral <= 1.5x
+                                        -- radius) is EXACTLY a fast curve's
+                                        -- signature — fired the second packet.
+                                        -- With it gone the TTI branch is the only
+                                        -- auto fire that can ever touch a targeted
+                                        -- approach: exactly ONE packet.
                                         local blocked = deathActive or infActive
                                                 or ball:FindFirstChild("ComboCounter") ~= nil
                                                 or root:FindFirstChild("SingularityCape") ~= nil
@@ -2957,9 +2946,10 @@ renderConn = RunService.RenderStepped:Connect(function()
                                         -- branch re-fired on the SAME approach.
                                         -- An approach is now closed ONLY by a
                                         -- target change, a new ball, or the 1.2 s
-                                        -- failsafe — true misses still get PANIC
-                                        -- (retries <= 4), which the observed
-                                        -- redirect blocks
+                                        -- failsafe. v27.2: PANIC (the last branch
+                                        -- that could refire an approach) is REMOVED
+                                        -- — this gate is now structurally complete:
+                                        -- exactly ONE packet per targeted approach
                                         local sameApproach = lastFireInfo ~= nil
                                                 and lastFireInfo.ball == ball
                                                 and target == lastFireInfo.target
@@ -2973,7 +2963,7 @@ renderConn = RunService.RenderStepped:Connect(function()
                                                 -- >= 1 rad/s) — the predicted path already
                                                 -- accounts for the curve, so a curved ball
                                                 -- can be parried ON TIME instead of
-                                                -- panic-late. Without PREDICT the veto
+                                                -- a late fire. Without PREDICT the veto
                                                 -- behaves exactly as before
                                                 and (not isCurved(ball, pingSec)
                                                         or (rotCurveOn
@@ -2988,7 +2978,6 @@ renderConn = RunService.RenderStepped:Connect(function()
                                                 parriedUntil = os.clock()
                                                         + math.max(parryCooldown(speed),
                                                                 pingSec * 2 + 0.06)
-                                                parryRetries = math.min(parryRetries + 1, 4)
                                                 lastFireInfo = { ball = ball, t = os.clock(),
                                                         vel = vel, target = target,
                                                         nn = neuraPending }
@@ -2997,31 +2986,6 @@ renderConn = RunService.RenderStepped:Connect(function()
                                                 fireSelected()
                                                 setBaseStatus(predictPct > 0
                                                         and "PREDICT PARRY" or "TTI PARRY")
-                                        elseif armed and panic and parryRetries < 4
-                                                -- v27.1: a flip after our fire = the
-                                                -- parry RESOLVED (redirect replicated);
-                                                -- a deflected ball grazing us must not
-                                                -- bait a last-chance packet into the
-                                                -- game's parry cooldown. No flip = true
-                                                -- miss = PANIC stays armed
-                                                and not (lastFireInfo ~= nil
-                                                        and lastFireInfo.ball == ball
-                                                        and approachResolvedSince(
-                                                                ball, lastFireInfo.t))
-                                                and os.clock() - lastAutoFireAt >= 0.08 then
-                                                -- last-resort refire: contact imminent, the
-                                                -- curve veto no longer outranks survival
-                                                lastAutoFireAt = os.clock()
-                                                parriedUntil = os.clock()
-                                                        + parryCooldown(speed) * 0.6
-                                                parryRetries = parryRetries + 1
-                                                lastFireInfo = { ball = ball, t = os.clock(),
-                                                        vel = vel, target = target,
-                                                        nn = neuraPending }
-                                                lastTtiBucket = -1
-                                                fxBurst()
-                                                fireSelected()
-                                                setBaseStatus("PANIC PARRY")
                                         elseif target == LocalPlayer.Name then
                                                 if blocked then
                                                         setBaseStatus("PROTECTED")
