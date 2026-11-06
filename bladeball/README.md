@@ -1,9 +1,22 @@
-# Blade Ball — BYAKUGAN RS26.5 (Audi RS × iOS 26 Fluid)
+# Blade Ball — BYAKUGAN RS26.6 (Audi RS × iOS 26 Fluid)
 
 Mobile auto-parry for **Roblox Blade Ball**, built for **Delta iOS**.
 The original **RS HUD** is back — Tango Red / Carbon Audi look — rebuilt with
 iOS 26 liquid-glass motion: spring bounces, elastic pops, fluid steppers,
 parry shockwaves, a Dynamic Island and an animated boot sequence.
+
+**v26.6 — PREDICT PARRY (new):**
+- new **PREDICT** stepper on the panel: `OFF · 25% · 50% · 75% · 100%`
+- when on, the trigger measures a **predicted future ball position** instead
+  of the real one — lead = `PREDICT% × parry offset`, extrapolated with the
+  same second-order curve model as the yellow server dot (follows curved
+  flight)
+- fires **earlier by design** — for high ping or very fast balls where the
+  default window still feels a touch late; the island status shows
+  `PREDICT PARRY` so you can see it engaging
+- the fire window is **untouched** (pure send lead) — the predict lead lives
+  on the measurement side only, so the v26.4 double-count can never come back
+- **default OFF** — timing unchanged until you dial it in; start at 25–50%
 
 **v26.5.1 — OBFUSCATION REMOVED (plain build):**
 - the protected/obfuscated builds kept dying silently on Delta — the wrapper
@@ -113,6 +126,16 @@ fireWindow = clamp(offset/2 + 0.05 + speed/6000, 0.08, 0.42)   (v26.4: pure send
 proximity fallback uses REAL distance only (v26.4)
 ```
 
+### v26.6 — PREDICT (optional)
+
+```
+lead       = PREDICT% × parry_time_offset          (OFF = 0)
+measBall   = ballPos + vel × lead + ½ × accel × lead²
+trigger    measures measBall instead of the real ball
+fireWindow unchanged — predict adds lead on the MEASUREMENT side only,
+           so the total lead = window + predict, never double-counted
+```
+
 - **Distance-independent** — a 700 stud/s ball triggers on TIME, never on a
   radius it can cross between two frames.
 - **Curve-veto cap** — other players' parries can only block your parry for
@@ -145,6 +168,7 @@ Toggle `AUTO SPAM <15` on the HUD (ON by default).
 | SERVER DOT | Yellow server-ball prediction dot |
 | PARRY METHOD | `Auto (Smart) · Hook Replay · Button · Firesignal · Remote` |
 | CURVE MODE | `Camera · Random · Accelerated · Backwards · Slow · High · Normal · Speed · Down · Left · Right` |
+| PREDICT | Future-ball lead: `OFF · 25% · 50% · 75% · 100%` of the parry offset (default OFF) |
 
 Stats strip: **PING · BALL SPD · RADIUS · OFFSET** (live parry time offset).
 Diagnostics: `RESCAN TOKEN` / `RE-ARM HOOK` buttons + token/capture caption.
@@ -162,3 +186,4 @@ Close (`×`) unloads the script completely.
 | Parries feel early/late | Watch the OFFSET stat — it is `2×(pings + machine delay)` by design; v26.4 fixed the double-counted lead, so fires now land ~`1×(pings+machine)` before contact |
 | Dies at long range / high speed | Fixed in v26.1 — TTI trigger + panic refire. Watch the island: it shows live `TTI 0.xx` countdown when targeted |
 | Fires when the ball is far away | Fixed in v26.4 — the trigger used the time-extrapolated ball and read it as "close"; it now measures the real ball only |
+| Parries too early with PREDICT on | PREDICT adds extra lead on top of the v26.4 window by design — step it down (50% → 25%) or set OFF; OFF is the v26.5 timing exactly |
