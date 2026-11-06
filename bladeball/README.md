@@ -1,9 +1,16 @@
-# Blade Ball — BYAKUGAN RS26.1 (Audi RS × iOS 26 Fluid)
+# Blade Ball — BYAKUGAN RS26.2 (Audi RS × iOS 26 Fluid)
 
 Mobile auto-parry for **Roblox Blade Ball**, built for **Delta iOS**.
 The original **RS HUD** is back — Tango Red / Carbon Audi look — rebuilt with
 iOS 26 liquid-glass motion: spring bounces, elastic pops, fluid steppers,
 parry shockwaves, a Dynamic Island and an animated boot sequence.
+
+**v26.2 — SMOOTH + MINIMAL update:**
+- **BYAKU-BOT** — an ascii robot lives in the Dynamic Island: blinks, smiles, jumps up every now and then (zero-cost text animation)
+- **Parry flash is now minimal white** (red removed)
+- **PERF MODE toggle** — plastic-ifies parts, kills textures/decals/particles/trails/beams/highlights/shadows, drops render quality — snapshotted & fully restorable
+- **Anti-lag HUD** — cached label writes, quantized TTI text, throttled stats, frozen cosmetic tweens in perf mode
+- **Darker minimal RS theme** + staggered iOS row cascade on open
 
 **v26.1 — LONG-RANGE HIGH-SPEED update:** time-to-impact interception,
 second-order (curved) server-ball extrapolation, capped curve-veto, adaptive
