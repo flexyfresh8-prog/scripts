@@ -1,9 +1,20 @@
-# Blade Ball — BYAKUGAN RS26.8 (Audi RS × iOS 26 Fluid)
+# Blade Ball — BYAKUGAN RS26.9 (Audi RS × iOS 26 Fluid)
 
 Mobile auto-parry for **Roblox Blade Ball**, built for **Delta iOS**.
 The original **RS HUD** is back — Tango Red / Carbon Audi look — rebuilt with
 iOS 26 liquid-glass motion: spring bounces, elastic pops, fluid steppers,
 parry shockwaves, a Dynamic Island and an animated boot sequence.
+
+**v26.9 — SPAM OVERHAUL (tuned):**
+- **proximity-only engage**: the ball within **10 studs of you**, regardless of
+  who it is targeting — the target attribute flickers `nil` mid-flight and
+  gating on it let close balls slip through unspammed (hysteresis release at
+  14 studs)
+- **fire rate 0.09 → 0.04 s** (~25 packets/s): spam exists to saturate the
+  server's validation window — an 11/s trickle missed it on laggy frames
+- per-engagement cap 14 → 20; release / post-cap cooldowns unchanged
+  (0.6 s / 1 s) — an infinite spam on a hovering ball was redirecting it
+  into you (v26.3 lesson kept)
 
 **v26.8 — ROTATION CURVE (new):**
 - the ball is steered by whoever it is locked ON: the server bends the
@@ -198,18 +209,20 @@ fireWindow unchanged — predict adds lead on the MEASUREMENT side only,
 ## Auto spam
 
 ```
-distance(ball → its target) ≤ 15 studs  →  spam ENGAGES (rapid hook replays)
-distance(ball → its target) > 22 studs  →  spam releases (hysteresis)
+distance(ball → you) ≤ 10 studs  →  spam ENGAGES (hook replays, 0.04 s apart)
+distance(ball → you) > 14 studs  →  spam releases (hysteresis)
 ```
 
-Toggle `AUTO SPAM <15` on the HUD (ON by default).
+Pure proximity — targeting is ignored entirely (a flickering target
+attribute used to leave close balls unspammed). Toggle `AUTO SPAM <10` on
+the HUD (ON by default). Cap 20 fires per engagement, then a 1 s cooldown.
 
 ## HUD controls
 
 | Control | What it does |
 | --- | --- |
 | AUTO PARRY | Master switch (ON at boot) |
-| AUTO SPAM <15 | 15-stud auto spam engagement |
+| AUTO SPAM <10 | 10-stud auto spam engagement (proximity-only, ~25 fires/s) |
 | PARRY SHOCKWAVE | Screen-edge glow + island ring on every parry |
 | BYAKUGAN AURA | Red character highlight |
 | SERVER DOT | Yellow server-ball prediction dot |
