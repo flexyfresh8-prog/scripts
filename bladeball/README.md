@@ -18,9 +18,12 @@ parry shockwaves, a Dynamic Island and an animated boot sequence.
   subtraction)
 - the offset formula **still** drives the server-ball dot + prediction
   exactly as designed (`2 × (pings + machine)`)
-- 🔒 this file is now a **PROTECTED BUILD**: identifiers mangled, all strings
-  + the whole body encrypted (loadstring wrapper). The readable source is
-  kept private by the owner
+- 🔒 both published files are **PROTECTED BUILDS** — mangled identifiers,
+  encrypted strings, no comments. The readable source is kept private by
+  the owner:
+  - **Main file** — slim protected build: runs directly (no wrapper)
+  - **Vault file** — fully sealed: the whole body is additionally encrypted
+    behind a loadstring payload, with staged on-screen boot diagnostics
 
 **v26.3 — SURVIVAL FIX:** auto spam only engages when the ball is actually
 targeting YOU; fires capped 14/engagement @ 0.09 s; target-attribute flicker
@@ -39,8 +42,17 @@ cooldown + panic refire. No more dying to 500+ stud/s balls from 300+ studs.
 
 ## Run it (Delta mobile)
 
+Main (slim protected build):
+
 ```lua
 loadstring(game:HttpGet("https://raw.githubusercontent.com/YOUR-USERNAME/scripts/main/bladeball/BladeBall_Byakugan_RS26.lua", true))()
+```
+
+Fully sealed (vault) build — same engine, encrypted payload, shows a boot
+status pill at the top of the screen while loading:
+
+```lua
+loadstring(game:HttpGet("https://raw.githubusercontent.com/YOUR-USERNAME/scripts/main/bladeball/BladeBall_Byakugan_RS26_vault.lua", true))()
 ```
 
 > Replace `YOUR-USERNAME` with your GitHub username. The repo must be public
@@ -121,6 +133,7 @@ Close (`×`) unloads the script completely.
 
 | Symptom | Fix |
 | --- | --- |
+| Executed, nothing popped up | A small dark pill `BYAKUGAN RS26.4 ▸ booting…` should appear top-center within ~2 s. **No pill at all** → the fetch failed (check Delta console, re-execute, or GitHub rate-limited — wait a minute). **Pill shows, then vanishes, no HUD** → script error — switch to the vault build, whose pill prints the exact stage + error text |
 | `PRY NO GETGC` | Executor lacks `getgc` — hook replay unavailable, use Button method |
 | Capture never arms | Tap block once manually so the game sends the real packet |
 | Parries feel early/late | Watch the OFFSET stat — it is `2×(pings + machine delay)` by design; v26.4 fixed the double-counted lead, so fires now land ~`1×(pings+machine)` before contact |
