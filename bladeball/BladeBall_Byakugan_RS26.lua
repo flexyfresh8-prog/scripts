@@ -109,6 +109,10 @@
 --          its chance to arrive, so a true miss still gets the last-
 --          chance refire (retries <= 4 unchanged), a saved approach
 --          stays silent
+--        · lockout ping = max(Data Ping, GetNetworkPing): Data Ping can
+--          read 0 for the first frames (or be missing on an executor)
+--          and that silently shrank the lockout back to the 0.14 s
+--          fast-ball cooldown — the double came back
 -- ============================================================
 
 -- ============================================================
@@ -2341,7 +2345,14 @@ local lastHud = 0
 renderConn = RunService.RenderStepped:Connect(function()
         pcall(function()
                 frameCount = frameCount + 1
-                local pingSec = getPingMs() / 1000
+                -- v26.7: lockout ping = the WORST case of the two pings.
+                -- "Data Ping" can read 0 (first frames after join, or the
+                -- stat missing on some executors) — a 0 here collapsed the
+                -- anti-double lockout to the 0.14 s fast-ball cooldown and
+                -- the double parry returned. GetNetworkPing is always
+                -- present, so take whichever reads higher.
+                local pingSec = math.max(getPingMs(),
+                        getPlayerPingSec() * 1000) / 1000
                 local ball = getActiveBall()
                 local char = LocalPlayer.Character
                 local root = char and char:FindFirstChild("HumanoidRootPart")
