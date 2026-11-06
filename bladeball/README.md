@@ -20,6 +20,10 @@ parry shockwaves, a Dynamic Island and an animated boot sequence.
   — PANIC opens only after the redirect had its chance to arrive. A true
   miss still gets the last-chance refire (retries ≤ 4 unchanged); a saved
   approach stays silent
+- lockout ping is the **worst case** of Data Ping and GetNetworkPing —
+  Data Ping can read 0 for the first frames (or be missing on an executor),
+  which silently shrank the lockout back to the `0.14 s` fast-ball cooldown
+  and let the double return
 - auto-spam shots also arm the gate, so the TTI branch can't stack a wasted
   packet on top of an engagement that is already firing
 
@@ -205,4 +209,4 @@ Close (`×`) unloads the script completely.
 | Dies at long range / high speed | Fixed in v26.1 — TTI trigger + panic refire. Watch the island: it shows live `TTI 0.xx` countdown when targeted |
 | Fires when the ball is far away | Fixed in v26.4 — the trigger used the time-extrapolated ball and read it as "close"; it now measures the real ball only |
 | Parries too early with PREDICT on | PREDICT adds extra lead on top of the v26.4 window by design — step it down (50% → 25%) or set OFF; OFF is the v26.5 timing exactly |
-| Double parries, then dies on cooldown | Fixed in v26.7 — the second packet fired while the redirect was still replicating and wasted the parry cooldown before contact. TTI now fires once per approach and PANIC waits out `2 × ping + 0.06` first |
+| Double parries, then dies on cooldown | Fixed in v26.7 — the second packet fired while the redirect was still replicating and wasted the parry cooldown before contact. TTI now fires once per approach and PANIC waits out `2 × ping + 0.06` first; the lockout ping is `max(Data Ping, GetNetworkPing)` so it can't collapse to 0 |
