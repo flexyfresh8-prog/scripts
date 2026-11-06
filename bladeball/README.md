@@ -1,9 +1,27 @@
-# Blade Ball — BYAKUGAN RS27.1 (Audi RS × iOS 26 Fluid)
+# Blade Ball — BYAKUGAN RS27.2 (Audi RS × iOS 26 Fluid)
 
 Mobile auto-parry for **Roblox Blade Ball**, built for **Delta iOS**.
 The original **RS HUD** is back — Tango Red / Carbon Audi look — rebuilt with
 iOS 26 liquid-glass motion: spring bounces, elastic pops, fluid steppers,
 parry shockwaves, a Dynamic Island and an animated boot sequence.
+
+**v27.2 — PANIC REMOVED + SPAM RETUNE (user diagnosis):**
+- **the last double was a fast curve — and it was PANIC, not the curve
+  predictor**: on a hard curve the ball's velocity can flip in steps (the
+  steerer re-aims mid-flight), the v27.1 dot < 0.3 latch can read those
+  steps as steering and miss the true redirect instant, the lockout then
+  expires while the ball still reads incoming, and PANIC — whose trigger
+  (`tti ≤ 50%` of window, lateral ≤ 1.5× radius) is exactly a fast curve's
+  signature — fired the **second packet**
+- **PANIC is removed entirely.** It was the only branch that could ever
+  fire twice on one approach, so a targeting double is now structurally
+  impossible: TTI = exactly one packet per approach (v27.1 gate), spam =
+  its own proximity system (multi-fire by design, never gated by this rule)
+- a true miss now recovers via **AUTO SPAM**: engage widened **10 → 13
+  studs** (release 14 → 16, hysteresis kept) — a wider net replaces the
+  panic backstop
+- spam "a bit too fast": throttle **0.02 → 0.03 s (~50 → ~33 packets/s)**,
+  cap 30 kept — the saturation envelope stretches 0.6 → 0.9 s
 
 **v27.1 — APPROACH RESOLVER (double-parry, round two):**
 - **why v26.7 still doubled**: the once-per-approach gate released when the
@@ -224,8 +242,8 @@ resolve    = velocity flip (> 72°/frame) = redirect landed,
 
 - output is **exactly 0** until the first resolved approach — boot behavior
   identical to v26.9
-- the bias shifts the whole window (TTI branch + PANIC threshold), which is
-  the point: it is a learned correction of YOUR end-to-end latency
+- the bias shifts the whole TTI fire window, which
+  is the point: it is a learned correction of YOUR end-to-end latency
 
 ### v26.1 — time-to-impact interception (long range, high speed)
 
@@ -256,30 +274,31 @@ fireWindow unchanged — predict adds lead on the MEASUREMENT side only,
   max 1.2 s regardless of range (was: `reachTime/1.1` = seconds of deafness
   at long range).
 - **Adaptive cooldown** — `0.5 − speed/1600` (0.14–0.5 s): fast balls re-arm
-  fast, so a wasted early fire can still be corrected.
-- **PANIC refire** — contact imminent (`tti ≤ 50%` of window): fires anyway,
-  curve veto ignored, up to 4 attempts per target cycle.
+  fast so the next approach after a redirect is covered.
+- **No panic refire (v27.2)** — the old last-chance refire was the one
+  branch that could double-fire an approach; it is removed entirely and a
+  miss now recovers via the (wider) AUTO SPAM window.
 - **Proximity fallback** — the old radius trigger still handles slow/close
   balls (trusted under 140 stud/s, or inside 70 studs).
 
 ## Auto spam
 
 ```
-distance(ball → you) ≤ 10 studs  →  spam ENGAGES (hook replays, 0.02 s apart)
-distance(ball → you) > 14 studs  →  spam releases (hysteresis)
+distance(ball → you) ≤ 13 studs  →  spam ENGAGES (hook replays, 0.03 s apart)
+distance(ball → you) > 16 studs  →  spam releases (hysteresis)
 ```
 
 Pure proximity — targeting is ignored entirely (a flickering target
-attribute used to leave close balls unspammed). Toggle `AUTO SPAM <10` on
-the HUD (ON by default). Cap 30 fires per engagement at ~50/s, then a 1 s
-cooldown.
+attribute used to leave close balls unspammed). Toggle `AUTO SPAM <13` on
+the HUD (ON by default). Cap 30 fires per engagement at ~33/s (0.9 s
+envelope), then a 1 s cooldown.
 
 ## HUD controls
 
 | Control | What it does |
 | --- | --- |
 | AUTO PARRY | Master switch (ON at boot) |
-| AUTO SPAM <10 | 10-stud auto spam engagement (proximity-only, ~50 fires/s) |
+| AUTO SPAM <13 | 13-stud auto spam engagement (proximity-only, ~33 fires/s) |
 | PARRY SHOCKWAVE | Screen-edge glow + island ring on every parry |
 | BYAKUGAN AURA | Red character highlight |
 | SERVER DOT | Yellow server-ball prediction dot |
@@ -303,10 +322,10 @@ Close (`×`) unloads the script completely.
 | `PRY NO GETGC` | Executor lacks `getgc` — hook replay unavailable, use Button method |
 | Capture never arms | Tap block once manually so the game sends the real packet |
 | Parries feel early/late | Watch the OFFSET stat — it is `2×(pings + machine delay)` by design; v26.4 fixed the double-counted lead, so fires now land ~`1×(pings+machine)` before contact |
-| Dies at long range / high speed | Fixed in v26.1 — TTI trigger + panic refire. Watch the island: it shows live `TTI 0.xx` countdown when targeted |
+| Dies at long range / high speed | Fixed in v26.1 — TTI trigger. Watch the island: it shows live `TTI 0.xx` countdown when targeted |
 | Fires when the ball is far away | Fixed in v26.4 — the trigger used the time-extrapolated ball and read it as "close"; it now measures the real ball only |
 | Parries too early with PREDICT on | PREDICT adds extra lead on top of the v26.4 window by design — step it down (50% → 25%) or set OFF; OFF is the v26.5 timing exactly |
-| Curved balls still parry late (PANIC only) | Turn PREDICT on (25–50%) and keep ROTATION ON — the steerer's yaw rate leads the curve so TTI can fire during the bend. If a friend's curves predict the wrong side, flip ROTATION OFF and report it — the turn-side gain is tunable |
-| Double parries, then dies on cooldown | v26.7 fired once per approach but its gate released on a 6 stud/s velocity drift — a homing ball bends past that in ~0.1 s, so the second packet still went out. **Fixed in v27.1**: the approach closes only on a target change / new ball / 1.2 s failsafe, and the observed redirect (instant velocity flip) blocks PANIC, so a resolved approach can never waste the parry cooldown |
+| Curved balls still parry late (pre-v26.8 behavior) | Turn PREDICT on (25–50%) and keep ROTATION ON — the steerer's yaw rate leads the curve so TTI can fire during the bend. If a friend's curves predict the wrong side, flip ROTATION OFF and report it — the turn-side gain is tunable |
+| Double parries, then dies on cooldown | v26.7 fired once per approach but its gate released on a 6 stud/s velocity drift — a homing ball bends past that in ~0.1 s, so the second packet still went out. **Fixed in v27.1**: the approach closes only on a target change / new ball / 1.2 s failsafe. **PANIC — the only branch that could still refire an approach — is removed entirely in v27.2**, so a targeting double is structurally impossible |
 | Parry timing got worse after NEURA learned | Give it 10–20 approaches to converge (watch it settle); if a weird session poisoned it, re-execute the script — the net resets and re-learns. `NEURA OFF` = exact v26.9 timing |
-| Spam drains too fast / too slow | Engagement is 30 fires @ ~50/s (0.6 s envelope) with a 1 s post-cap cooldown — tuned so the saturation window covers `2 × ping + 0.06`; ask for a retune with your ping if it still misses |
+| Spam drains too fast / too slow | Engagement is 30 fires @ ~33/s (0.9 s envelope, 0.03 s throttle — v27.2) with a 1 s post-cap cooldown — tuned so the saturation window covers `2 × ping + 0.06`; ask for a retune with your ping if it still misses |
