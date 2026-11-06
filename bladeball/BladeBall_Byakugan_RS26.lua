@@ -1,5 +1,5 @@
 -- ============================================================
--- Blade Ball Mobile — BYAKUGAN RS26  (Audi RS × iOS 26 Fluid)
+-- Blade Ball Mobile — BYAKUGAN RS26.2  (Audi RS × iOS 26 Fluid)
 -- ============================================================
 -- UI   : the original RS HUD is back — same Tango Red / Carbon
 --        Audi look, rebuilt with iOS 26 liquid-glass motion:
@@ -38,6 +38,16 @@
 --        22 studs (hysteresis, no flicker).
 -- Boot-safety: UI builds FIRST, no infinite waits, every error
 --        shows a visible red panel instead of silent death.
+-- v26.2 — SMOOTH + MINIMAL:
+--        · BYAKU-BOT ascii robot lives in the Dynamic Island
+--          (blinks, smiles, jumps up every now and then)
+--        · parry flash is now minimal WHITE (red removed)
+--        · PERF MODE: plastic-ifies parts, kills textures/
+--          particles/shadows/beams/highlights, drops quality —
+--          fully restorable on toggle-off
+--        · anti-lag HUD: cached label writes, quantized TTI
+--          text, throttled stats, frozen cosmetic tweens in perf
+--        · darker minimal RS theme + staggered row cascade on open
 -- ============================================================
 
 local function byakFatal(msg)
@@ -130,6 +140,7 @@ local dotEnabled       = true
 local auraEnabled      = true
 local autoSpamEnabled  = true         -- NEW: 15-stud auto spam
 local fxEnabled        = true         -- parry shockwave FX
+local perfMode         = false        -- HIGH PERFORMANCE mode
 local parryMethod      = "Auto"       -- Auto | Hook | Button | Signal | Remote
 local parryCurve       = "Camera"     -- NAZK curve list
 
@@ -146,6 +157,7 @@ local spamFireCount  = 0
 local spamActive     = false         -- NEW: auto-spam engaged state
 local parriedUntil   = 0
 local parryRetries   = 0
+local lastTtiBucket  = -1        -- anti-garbage TTI text bucket
 local lastTargetOf   = {}
 local deathActive    = false
 local infActive      = false
@@ -158,6 +170,7 @@ local uiAlive   = true
 -- forward declarations (assigned later)
 local fxBurst = nil    -- parry shockwave (UI assigns)
 local unloadFn = nil   -- full unload (UI assigns)
+local applyPerfUI = nil -- perf-mode UI gate (UI assigns)
 
 -- ============================================================
 -- [3] STATUS MACHINE (island + footer read from here)
@@ -887,13 +900,13 @@ end)
 local THEME = {
         Red       = Color3.fromRGB(187, 10, 48),  -- Audi Tango Red
         RedGlow   = Color3.fromRGB(255, 45, 70),
-        Carbon    = Color3.fromRGB(13, 13, 16),
-        Panel     = Color3.fromRGB(27, 27, 32),
-        PanelDark = Color3.fromRGB(18, 18, 22),
-        Hover     = Color3.fromRGB(36, 36, 43),
-        Stroke    = Color3.fromRGB(48, 48, 56),
+        Carbon    = Color3.fromRGB(9, 9, 12),     -- v26.2: deeper dark
+        Panel     = Color3.fromRGB(16, 16, 20),
+        PanelDark = Color3.fromRGB(13, 13, 16),
+        Hover     = Color3.fromRGB(24, 24, 29),
+        Stroke    = Color3.fromRGB(38, 38, 45),
         Text      = Color3.fromRGB(238, 238, 240),
-        TextDim   = Color3.fromRGB(128, 128, 136),
+        TextDim   = Color3.fromRGB(120, 120, 128),
         Glass     = Color3.fromRGB(255, 255, 255),
         Amber     = Color3.fromRGB(255, 159, 10),
         Good      = Color3.fromRGB(52, 199, 89),
@@ -1004,8 +1017,8 @@ do
         }
         for _, e in ipairs(edges) do
                 create("Frame", {
-                        Size = e.Size, Position = e.Pos, BackgroundColor3 = THEME.RedGlow,
-                        BackgroundTransparency = 0.5, BorderSizePixel = 0, Parent = fxGroup,
+                        Size = e.Size, Position = e.Pos, BackgroundColor3 = THEME.Glass,
+                        BackgroundTransparency = 0.72, BorderSizePixel = 0, Parent = fxGroup,
                         ZIndex = 5,
                 }, {
                         create("UIGradient", {
@@ -1029,7 +1042,7 @@ local main = create("CanvasGroup", {
         Position = UDim2.new(0.5, 0, 0.5, 14),
         Size = UDim2.fromOffset(WIN_W, winH),
         BackgroundColor3 = THEME.Carbon,
-        BackgroundTransparency = 0.16,
+        BackgroundTransparency = 0.05,
         BorderSizePixel = 0,
         ClipsDescendants = true,
         GroupTransparency = 1,
@@ -1037,7 +1050,7 @@ local main = create("CanvasGroup", {
         Parent = screenGui,
 })
 corner(main, 20)
-stroke(main, THEME.RedGlow, 4, 0.86)
+stroke(main, THEME.RedGlow, 2, 0.9) -- v26.2: slimmer halo, minimal
 local mainStroke = stroke(main, THEME.Red, 1.4, 0.15)
 local strokeGradient = create("UIGradient", {
         Color = ColorSequence.new({
@@ -1047,7 +1060,8 @@ local strokeGradient = create("UIGradient", {
         }),
         Parent = mainStroke,
 })
-tw(strokeGradient, 4, { Rotation = 360 }, Enum.EasingStyle.Linear, Enum.EasingDirection.InOut, -1):Play()
+local strokeGradTween = tw(strokeGradient, 4, { Rotation = 360 }, Enum.EasingStyle.Linear, Enum.EasingDirection.InOut, -1)
+strokeGradTween:Play()
 sheen(main, 24, 20)
 local winScale = create("UIScale", { Scale = 1, Parent = main })
 
@@ -1069,7 +1083,8 @@ local ambientGrad = create("UIGradient", {
         }),
         Rotation = 35, Parent = ambient,
 })
-tw(ambientGrad, 16, { Rotation = 395 }, Enum.EasingStyle.Linear, Enum.EasingDirection.InOut, -1):Play()
+local ambientGradTween = tw(ambientGrad, 16, { Rotation = 395 }, Enum.EasingStyle.Linear, Enum.EasingDirection.InOut, -1)
+ambientGradTween:Play()
 
 -- fit to phone screens
 local fitFactor, curWinScale = 1, 1
@@ -1118,8 +1133,8 @@ create("TextLabel", {
 create("TextLabel", {
         Size = UDim2.new(1, -120, 0, 12), Position = UDim2.new(0, 56, 0, 27),
         BackgroundTransparency = 1,
-        Text = "iOS 26 FLUID • HOOK REPLAY EDITION",
-        Font = Enum.Font.GothamBold, TextSize = 9,
+        Text = "RS26.2 · HOOK REPLAY · PERF",
+        Font = Enum.Font.GothamBold, TextSize = 8,
         TextColor3 = THEME.TextDim, TextXAlignment = Enum.TextXAlignment.Left,
         Parent = header, ZIndex = 3,
 })
@@ -1142,6 +1157,9 @@ create("UIGradient", {
 task.spawn(function()
         task.wait(2.5)
         while uiAlive and sweep.Parent do
+                if perfMode then sweep.Visible = false task.wait(1)
+                else
+                sweep.Visible = true
                 sweep.Position = UDim2.new(0, -90, 0, 0)
                 local t = tw(sweep, 1.1, { Position = UDim2.new(1, 20, 0, 0) }, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut)
                 t:Play()
@@ -1149,6 +1167,7 @@ task.spawn(function()
                 t.Completed:Connect(function() done = true end)
                 while not done and uiAlive and sweep.Parent do task.wait(0.1) end
                 task.wait(6)
+                end
         end
 end)
 
@@ -1207,9 +1226,29 @@ local function setStatus(active)
         end
 end
 
+-- PERF MODE UI GATE — freezes every cosmetic infinite animation
+-- (rotating strokes, drifting wash, header sweep, dot pulse).
+-- These loops re-render every frame on mobile and were the main
+-- source of HUD lag.
+applyPerfUI = function()
+        local on = perfMode
+        if strokeGradTween then
+                if on then strokeGradTween:Pause() else strokeGradTween:Play() end
+        end
+        if ambientGradTween then
+                if on then ambientGradTween:Pause() else ambientGradTween:Play() end
+        end
+        if pulseTween then
+                if on then pulseTween:Pause()
+                elseif isRunning and not pulseTween.Playing then pulseTween:Play() end
+        end
+        if sweep and sweep.Parent then sweep.Visible = not on end
+end
+
 -- ============================================================
 -- [12] ROW BUILDERS — spring toggles + fluid steppers
 -- ============================================================
+local animRows = {} -- registered rows -> staggered cascade on open
 local rowY = 104 -- cursor shared with the wiring section
 local function rowSlot(h)
         local y = rowY
@@ -1287,6 +1326,7 @@ local function makeSwitchRow(labelText, initial, callback)
                 elasticPop(knobScale, state and 1.28 or 1.16)
                 callback(state)
         end)
+        table.insert(animRows, row)
         return row
 end
 
@@ -1371,15 +1411,16 @@ local function makeStepperRow(labelText, options, startIndex, onPick)
         leftBtn.Activated:Connect(function() flashArrow(leftBtn) step(-1) end)
         rightBtn.Activated:Connect(function() flashArrow(rightBtn) step(1) end)
         row.Activated:Connect(function() step(1) end)
+        table.insert(animRows, row)
         return row
 end
 
 -- ============================================================
--- [13] DYNAMIC ISLAND — the pill (kept from the approved UI)
+-- [13] DYNAMIC ISLAND — the pill + BYAKU-BOT ascii mascot
 -- ============================================================
 local pill = create("CanvasGroup", {
         Name = "Island", AnchorPoint = Vector2.new(0.5, 0),
-        Position = UDim2.new(0.5, 0, 0, 12), Size = UDim2.fromOffset(96, 34),
+        Position = UDim2.new(0.5, 0, 0, 12), Size = UDim2.fromOffset(118, 34),
         BackgroundColor3 = Color3.fromRGB(8, 8, 10), BackgroundTransparency = 0.12,
         BorderSizePixel = 0, ClipsDescendants = true, GroupTransparency = 1,
         Visible = false, Parent = screenGui,
@@ -1388,18 +1429,75 @@ fullCorner(pill)
 stroke(pill, THEME.Glass, 1, 0.82)
 sheen(pill, 10, 17)
 local pillScale = create("UIScale", { Scale = 1, Parent = pill })
-local pillDot = create("Frame", {
-        AnchorPoint = Vector2.new(0, 0.5), Size = UDim2.fromOffset(8, 8),
-        Position = UDim2.new(0, 14, 0.5, 0),
-        BackgroundColor3 = THEME.TextDim, BorderSizePixel = 0, Parent = pill,
+
+-- BYAKU-BOT — tiny ascii robot living in the island. Blinks,
+-- smiles, and jumps up every now and then. Pure Text swaps, so
+-- it costs nothing even at 60 fps.
+local bot = create("TextLabel", {
+        AnchorPoint = Vector2.new(0, 0.5),
+        Size = UDim2.fromOffset(26, 16), Position = UDim2.new(0, 8, 0.5, -1),
+        BackgroundTransparency = 1, Text = "^_^",
+        Font = Enum.Font.Code, TextSize = 12,
+        TextColor3 = THEME.TextDim, TextXAlignment = Enum.TextXAlignment.Center,
+        Parent = pill,
 })
-fullCorner(pillDot)
+local botScale = create("UIScale", { Scale = 1, Parent = bot })
+do
+        local BOT_IDLE, BOT_BLINK, BOT_JOY, BOT_JUMP = "^_^", "-_-", "^o^", "\\o/"
+        local lastBlink = os.clock()
+        local nextJump  = os.clock() + math.random(5, 10)
+        local jumping   = false
+        task.spawn(function()
+                while uiAlive do
+                        if not bot.Parent then break end
+                        local now = os.clock()
+                        if not jumping and now >= nextJump then
+                                jumping = true
+                                nextJump = now + math.random(7, 14)
+                                -- squash -> leap -> elastic land -> joy
+                                tw(botScale, 0.1, { Scale = 1.2 }, Enum.EasingStyle.Back):Play()
+                                bot.Text = BOT_IDLE
+                                task.wait(0.12)
+                                if not bot.Parent then break end
+                                bot.Text = BOT_JUMP
+                                tw(bot, 0.32, { Position = UDim2.new(0, 8, 0.5, -9) },
+                                        Enum.EasingStyle.Back, Enum.EasingDirection.Out):Play()
+                                task.wait(0.34)
+                                if not bot.Parent then break end
+                                tw(bot, 0.45, { Position = UDim2.new(0, 8, 0.5, -1) },
+                                        Enum.EasingStyle.Elastic, Enum.EasingDirection.Out):Play()
+                                task.wait(0.24)
+                                if not bot.Parent then break end
+                                bot.Text = BOT_JOY
+                                task.wait(0.55)
+                                if not bot.Parent then break end
+                                tw(botScale, 0.3, { Scale = 1 }, Enum.EasingStyle.Elastic):Play()
+                                bot.Text = BOT_IDLE
+                                jumping = false
+                        elseif not jumping and now - lastBlink >= 3.8 then
+                                lastBlink = now
+                                bot.Text = BOT_BLINK
+                                task.wait(0.14)
+                                if not bot.Parent then break end
+                                bot.Text = BOT_IDLE
+                        end
+                        task.wait(0.1)
+                end
+        end)
+end
+
 local pillLabel = create("TextLabel", {
-        Size = UDim2.new(1, -44, 1, 0), Position = UDim2.new(0, 30, 0, 0),
+        Size = UDim2.new(1, -70, 1, 0), Position = UDim2.new(0, 36, 0, 0),
         BackgroundTransparency = 1, Text = "Idle",
         Font = Enum.Font.GothamBold, TextSize = 12,
         TextColor3 = THEME.Text, TextXAlignment = Enum.TextXAlignment.Left, Parent = pill,
 })
+local pillDot = create("Frame", {
+        AnchorPoint = Vector2.new(1, 0.5), Size = UDim2.fromOffset(6, 6),
+        Position = UDim2.new(1, -10, 0.5, 0),
+        BackgroundColor3 = THEME.TextDim, BorderSizePixel = 0, Parent = pill,
+})
+fullCorner(pillDot)
 local pillButton = create("TextButton", {
         Size = UDim2.new(1, 0, 1, 0), BackgroundTransparency = 1, Text = "", Parent = pill,
 })
@@ -1411,7 +1509,7 @@ local pillRing = create("Frame", {
         BorderSizePixel = 0, ZIndex = 4, Parent = screenGui,
 })
 fullCorner(pillRing)
-local pillRingStroke = stroke(pillRing, THEME.RedGlow, 2.5, 1)
+local pillRingStroke = stroke(pillRing, THEME.Glass, 2.5, 1)
 
 local popTween = nil
 local function islandPop(strength)
@@ -1423,6 +1521,7 @@ local function islandPop(strength)
 end
 local wiggleToken = 0
 local function islandWiggle()
+        if perfMode then return end -- v26.2: no cosmetic churn in perf
         if not pill.Parent then return end
         wiggleToken = wiggleToken + 1
         local token = wiggleToken
@@ -1436,18 +1535,19 @@ local function islandWiggle()
         end)
 end
 
--- THE SHOCKWAVE — edge glow + island ring on every engaged parry
+-- THE SHOCKWAVE — v26.2: minimal WHITE pulse (red removed),
+-- skipped entirely in perf mode
 fxBurst = function()
-        if not fxEnabled then return end
+        if not fxEnabled or perfMode then return end
         if fxGroup and fxGroup.Parent then
-                fxGroup.GroupTransparency = 0.12
-                tw(fxGroup, 0.34, { GroupTransparency = 1 }, Enum.EasingStyle.Quad, Enum.EasingDirection.Out):Play()
+                fxGroup.GroupTransparency = 0.55
+                tw(fxGroup, 0.26, { GroupTransparency = 1 }, Enum.EasingStyle.Quad, Enum.EasingDirection.Out):Play()
         end
         if pillRing and pillRing.Parent then
                 pillRing.Size = UDim2.fromOffset(34, 34)
-                pillRingStroke.Transparency = 0.15
-                tw(pillRing, 0.55, { Size = UDim2.fromOffset(130, 130) }, Enum.EasingStyle.Quint, Enum.EasingDirection.Out):Play()
-                tw(pillRingStroke, 0.55, { Transparency = 1 }, Enum.EasingStyle.Quint, Enum.EasingDirection.Out):Play()
+                pillRingStroke.Transparency = 0.3
+                tw(pillRing, 0.5, { Size = UDim2.fromOffset(120, 120) }, Enum.EasingStyle.Quint, Enum.EasingDirection.Out):Play()
+                tw(pillRingStroke, 0.5, { Transparency = 1 }, Enum.EasingStyle.Quint, Enum.EasingDirection.Out):Play()
         end
 end
 
@@ -1468,6 +1568,20 @@ local function openMain()
         elasticPop(badgeScale, 1.3) -- RS badge springs in on every open
         islandPop(1.14)
         islandWiggle()
+        -- v26.2: iOS list cascade — rows drift up with stagger
+        for i, r in ipairs(animRows) do
+                if r.Parent then
+                        local bp = r.Position
+                        r.Position = UDim2.new(bp.X.Scale, bp.X.Offset,
+                                bp.Y.Scale, bp.Y.Offset + 18)
+                        task.delay(i * 0.032, function()
+                                if r.Parent then
+                                        tw(r, 0.5, { Position = bp },
+                                                Enum.EasingStyle.Back, Enum.EasingDirection.Out):Play()
+                                end
+                        end)
+                end
+        end
 end
 local function closeMain()
         if not winOpen then return end
@@ -1584,6 +1698,120 @@ local bootPct = create("TextLabel", {
 })
 
 -- ============================================================
+-- [15b] HIGH PERFORMANCE MODE — strips the 3D fat, restorable
+-- ============================================================
+-- Client-side only: plastic-ify parts, kill decals/textures/
+-- particles/beams/trails/highlights/shadows, drop quality level,
+-- flatten terrain fx. Originals are snapshotted and restored on
+-- toggle-off. New descendants (round resets) are stripped too.
+local perfBackup = {}
+local perfConn   = nil
+local perfGlobals = {}
+local PERF_KEEP_MAT = { Neon = true, ForceField = true }
+
+local function perfStrip(inst)
+        if perfBackup[inst] then return end
+        if inst:IsA("Terrain") then return end -- Terrain inherits BasePart; never touch it
+        pcall(function()
+                if inst:IsA("BasePart") then
+                        perfBackup[inst] = {
+                                mat = inst.Material, shadow = inst.CastShadow,
+                                refl = inst.Reflectance,
+                        }
+                        if not PERF_KEEP_MAT[inst.Material] then
+                                inst.Material = Enum.Material.SmoothPlastic
+                        end
+                        inst.CastShadow = false
+                        inst.Reflectance = 0
+                elseif inst:IsA("Decal") or inst:IsA("Texture") then
+                        perfBackup[inst] = { tr = inst.Transparency }
+                        inst.Transparency = 1
+                elseif inst:IsA("ParticleEmitter") or inst:IsA("Fire")
+                        or inst:IsA("Smoke") or inst:IsA("Sparkles")
+                        or inst:IsA("Trail") or inst:IsA("Beam") then
+                        perfBackup[inst] = { en = inst.Enabled }
+                        inst.Enabled = false
+                elseif inst:IsA("Highlight") then
+                        perfBackup[inst] = { en = inst.Enabled }
+                        inst.Enabled = false
+                elseif inst:IsA("Explosion") then
+                        perfBackup[inst] = { vis = inst.Visible }
+                        inst.Visible = false
+                else
+                        return
+                end
+        end)
+end
+
+local function perfRestoreAll()
+        if perfConn then perfConn:Disconnect() perfConn = nil end
+        for inst, snap in pairs(perfBackup) do
+                pcall(function()
+                        if inst and inst.Parent then
+                                if snap.mat ~= nil then
+                                        inst.Material = snap.mat
+                                        inst.CastShadow = snap.shadow
+                                        inst.Reflectance = snap.refl
+                                end
+                                if snap.tr ~= nil then inst.Transparency = snap.tr end
+                                if snap.en ~= nil then inst.Enabled = snap.en end
+                                if snap.vis ~= nil then inst.Visible = snap.vis end
+                        end
+                end)
+                perfBackup[inst] = nil
+        end
+end
+
+local function perfApplyWorld(on)
+        local Lighting = game:GetService("Lighting")
+        if on then
+                perfGlobals = {}
+                pcall(function() perfGlobals.shadows = Lighting.GlobalShadows end)
+                pcall(function() perfGlobals.diff = Lighting.EnvironmentDiffuseScale end)
+                pcall(function() perfGlobals.spec = Lighting.EnvironmentSpecularScale end)
+                pcall(function()
+                        local terr = Workspace.Terrain
+                        perfGlobals.deco = terr.Decoration
+                        perfGlobals.wsize = terr.WaterWaveSize
+                        perfGlobals.wspeed = terr.WaterWaveSpeed
+                        perfGlobals.wrefl = terr.WaterReflectance
+                end)
+                pcall(function() Lighting.GlobalShadows = false end)
+                pcall(function() Lighting.EnvironmentDiffuseScale = 0 end)
+                pcall(function() Lighting.EnvironmentSpecularScale = 0 end)
+                pcall(function()
+                        local terr = Workspace.Terrain
+                        terr.Decoration = false
+                        terr.WaterWaveSize = 0
+                        terr.WaterWaveSpeed = 0
+                        terr.WaterReflectance = 0
+                end)
+                pcall(function()
+                        settings().Rendering.QualityLevel = Enum.QualityLevel.Level1
+                end)
+                for _, d in ipairs(Workspace:GetDescendants()) do perfStrip(d) end
+                perfConn = Workspace.DescendantAdded:Connect(function(d)
+                        task.defer(perfStrip, d)
+                end)
+        else
+                perfRestoreAll()
+                pcall(function() Lighting.GlobalShadows = perfGlobals.shadows end)
+                pcall(function() Lighting.EnvironmentDiffuseScale = perfGlobals.diff end)
+                pcall(function() Lighting.EnvironmentSpecularScale = perfGlobals.spec end)
+                pcall(function()
+                        local terr = Workspace.Terrain
+                        terr.Decoration = perfGlobals.deco
+                        terr.WaterWaveSize = perfGlobals.wsize
+                        terr.WaterWaveSpeed = perfGlobals.wspeed
+                        terr.WaterReflectance = perfGlobals.wrefl
+                end)
+                pcall(function()
+                        settings().Rendering.QualityLevel = Enum.QualityLevel.Automatic
+                end)
+        end
+end
+
+-- ============================================================
 -- [16] WIRE ROWS TO THE ENGINE
 -- ============================================================
 makeSwitchRow("AUTO PARRY", isRunning, function(v)
@@ -1612,6 +1840,14 @@ end)
 makeSwitchRow("SERVER DOT", dotEnabled, function(v)
         dotEnabled = v
         serverBallDot.Transparency = v and 0 or 1
+end)
+
+makeSwitchRow("PERF MODE", perfMode, function(v)
+        perfMode = v
+        xpcall(function() perfApplyWorld(v) end, function() end)
+        if applyPerfUI then xpcall(function() applyPerfUI() end, function() end) end
+        pushStatus(v and "Perf mode ON" or "Perf mode off", 1.4)
+        if v then islandPop(1.1) end
 end)
 
 makeStepperRow("PARRY METHOD",
@@ -1752,6 +1988,11 @@ unloadFn = function()
                 pcall(function() c:Disconnect() end)
         end
         liveConns = {}
+        -- restore the world if perf mode was stripping it
+        if perfMode then
+                perfMode = false
+                xpcall(function() perfApplyWorld(false) end, function() end)
+        end
         pcall(function() screenGui:Destroy() end)
         pcall(function() serverBallDot:Destroy() end)
         local char = LocalPlayer.Character
@@ -1843,6 +2084,24 @@ local STATUS_COLORS = {
         ["Parry off"]     = THEME.TextDim,
 }
 local lastIslandText = nil
+-- v26.2 anti-lag: HUD writes are cached — a label is only touched
+-- when its value actually changed (every Roblox Text write forces
+-- a re-layout; writing 6 labels at 8 Hz for nothing = mobile lag)
+local hudTextCache, hudColCache = {}, {}
+local function hudSet(label, key, text)
+        if not label.Parent then return end
+        if hudTextCache[key] ~= text then
+                hudTextCache[key] = text
+                label.Text = text
+        end
+end
+local function hudCol(label, key, color)
+        if not label.Parent then return end
+        if hudColCache[key] ~= color then
+                hudColCache[key] = color
+                label.TextColor3 = color
+        end
+end
 local function updateHUD(ball, root, pingSec)
         local txt = resolvedStatus()
         local col = STATUS_COLORS[txt] or THEME.Text
@@ -1865,33 +2124,33 @@ local function updateHUD(ball, root, pingSec)
                 elseif dataPingMs < 160 then pcol = THEME.Amber
                 else pcol = THEME.Bad end
         end
-        if pingVal.Parent then
-                pingVal.Text = ptxt
-                pingVal.TextColor3 = pcol
-        end
+        hudSet(pingVal, "ping", ptxt)
+        hudCol(pingVal, "ping", pcol)
         if ball and root then
                 local vel = ballVelocity(ball)
                 local speed = vel.Magnitude
-                if speedVal.Parent then speedVal.Text = tostring(math.floor(speed)) end
-                if radiusVal.Parent then radiusVal.Text = tostring(math.floor(parryAccuracy(speed, pingSec))) end
+                hudSet(speedVal, "speed", tostring(math.floor(speed)))
+                hudSet(radiusVal, "radius", tostring(math.floor(parryAccuracy(speed, pingSec))))
         else
-                if speedVal.Parent then speedVal.Text = "--" end
-                if radiusVal.Parent then radiusVal.Text = "--" end
+                hudSet(speedVal, "speed", "--")
+                hudSet(radiusVal, "radius", "--")
         end
         if offsetVal.Parent then
                 local offsetMs = math.floor(getParryTimeOffset() * 1000)
-                offsetVal.Text = tostring(offsetMs) .. "ms"
-                offsetVal.TextColor3 = offsetMs > 250 and THEME.Bad
+                hudSet(offsetVal, "offset", tostring(offsetMs) .. "ms")
+                local ocol = offsetMs > 250 and THEME.Bad
                         or (offsetMs > 120 and THEME.Amber or THEME.Text)
+                hudCol(offsetVal, "offset", ocol)
         end
         if firesLabel.Parent then
-                firesLabel.Text = "fires " .. tostring(totalFires)
+                hudSet(firesLabel, "fires", "fires " .. tostring(totalFires))
         end
         if diagCaption.Parent then
                 local tokTxt = hookState.tokenOk and "FOUND" or (hookSupported and "SCANNING" or "NO GETGC")
                 local capTxt = (hookState.captured ~= nil) and "ARMED" or "TAP BLOCK ONCE"
-                diagCaption.Text = "PRY " .. tokTxt .. " · CAPTURE " .. capTxt
-                diagCaption.TextColor3 = (hookState.tokenOk and hookState.captured ~= nil) and THEME.Good or THEME.Amber
+                hudSet(diagCaption, "diag", "PRY " .. tokTxt .. " · CAPTURE " .. capTxt)
+                hudCol(diagCaption, "diag",
+                        (hookState.tokenOk and hookState.captured ~= nil) and THEME.Good or THEME.Amber)
         end
 end
 
@@ -2023,6 +2282,7 @@ renderConn = RunService.RenderStepped:Connect(function()
                                                 and not isCurved(ball, pingSec) then
                                                 parriedUntil = os.clock() + parryCooldown(speed)
                                                 parryRetries = math.min(parryRetries + 1, 4)
+                                                lastTtiBucket = -1
                                                 fxBurst()
                                                 fireSelected()
                                                 setBaseStatus("TTI PARRY")
@@ -2032,6 +2292,7 @@ renderConn = RunService.RenderStepped:Connect(function()
                                                 parriedUntil = os.clock()
                                                         + parryCooldown(speed) * 0.6
                                                 parryRetries = parryRetries + 1
+                                                lastTtiBucket = -1
                                                 fxBurst()
                                                 fireSelected()
                                                 setBaseStatus("PANIC PARRY")
@@ -2039,7 +2300,13 @@ renderConn = RunService.RenderStepped:Connect(function()
                                                 if blocked then
                                                         setBaseStatus("PROTECTED")
                                                 elseif tti < math.huge and tti <= fireTti + 0.6 then
-                                                        setBaseStatus(string.format("TTI %.2f", tti))
+                                                        -- quantized to 0.1 s steps: no string
+                                                        -- garbage every frame (mobile GC lag)
+                                                        local bucket = math.floor(tti * 10)
+                                                        if bucket ~= lastTtiBucket then
+                                                                lastTtiBucket = bucket
+                                                                setBaseStatus(string.format("TTI %.1f", bucket / 10))
+                                                        end
                                                 elseif nearDist <= accuracy + 14 then
                                                         setBaseStatus("Getting close")
                                                 else
@@ -2056,7 +2323,7 @@ renderConn = RunService.RenderStepped:Connect(function()
                         end
                 end
 
-                if os.clock() - lastHud >= 0.12 then
+                if os.clock() - lastHud >= (perfMode and 0.34 or 0.2) then
                         lastHud = os.clock()
                         updateHUD(ball, root, pingSec)
                 end
