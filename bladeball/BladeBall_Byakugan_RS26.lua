@@ -1,5 +1,5 @@
 -- ============================================================
--- Blade Ball Mobile — BYAKUGAN RS26.2  (Audi RS × iOS 26 Fluid)
+-- Blade Ball Mobile — BYAKUGAN RS26.3  (Audi RS × iOS 26 Fluid)
 -- ============================================================
 -- UI   : the original RS HUD is back — same Tango Red / Carbon
 --        Audi look, rebuilt with iOS 26 liquid-glass motion:
@@ -48,6 +48,13 @@
 --        · anti-lag HUD: cached label writes, quantized TTI
 --          text, throttled stats, frozen cosmetic tweens in perf
 --        · darker minimal RS theme + staggered row cascade on open
+-- v26.3 — SURVIVAL FIX (spam-kill bug):
+--        · auto spam engages ONLY when the ball is actually coming
+--          TO US (target == me) — spamming a ball that was passing
+--          to someone else redirected it straight into us
+--        · fires hard-capped at 14/engagement, throttled to 0.09 s
+--        · target-attribute flicker can no longer re-arm the parry
+--        · panic refire lateral tolerance tightened (1.5x radius)
 -- ============================================================
 
 local function byakFatal(msg)
@@ -154,7 +161,10 @@ local lastResult     = "—"
 local lastFireAt     = 0
 local lastSpamAt     = 0
 local spamFireCount  = 0
-local spamActive     = false         -- NEW: auto-spam engaged state
+local spamActive     = false         -- auto-spam engaged state
+local spamFires      = 0             -- fires in the CURRENT engagement
+local spamCooldownUntil = 0          -- re-arm delay between engagements
+local lastAutoFireAt = 0             -- shared throttle: ANY auto fire
 local parriedUntil   = 0
 local parryRetries   = 0
 local lastTtiBucket  = -1        -- anti-garbage TTI text bucket
@@ -2192,30 +2202,59 @@ renderConn = RunService.RenderStepped:Connect(function()
                         serverBallDot.Position = Vector3.new(0, -100, 0)
                 end
 
-                -- ===== AUTO SPAM =====
-                -- distance from the ball to ITS target <= 15 studs -> ENGAGE
-                -- (rapid hook-replay fires); releases above 22 studs.
-                if autoSpamEnabled and ball then
+                -- ===== AUTO SPAM (v26.3 — survival-gated) =====
+                -- Spam engages ONLY when the ball is actually coming TO US
+                -- (target == me) and is within 15 studs. Fires are capped
+                -- per engagement and throttled — an infinite 66/s spam on
+                -- a passing/hovering ball was redirecting it into us and
+                -- getting us killed.
+                if autoSpamEnabled and ball
+                        and not deathActive and not infActive then
+                        local spamTarget = ball:GetAttribute("target")
                         local _, tRoot = ballTargetPlayer(ball)
-                        if tRoot then
+                        local comingToMe = spamTarget == LocalPlayer.Name
+                                and tRoot ~= nil
+                        local protected = root ~= nil
+                                and (root:FindFirstChild("SingularityCape") ~= nil
+                                        or ball:FindFirstChild("ComboCounter") ~= nil)
+                        if comingToMe then
                                 local targetDist = (tRoot.Position - ball.Position).Magnitude
-                                if targetDist <= 15 and not spamActive then
+                                if not spamActive
+                                        and os.clock() >= spamCooldownUntil
+                                        and targetDist <= 15 and not protected then
                                         spamActive = true
+                                        spamFires = 0
                                         pushStatus("SPAM ENGAGED", 1.4)
                                         islandPop(1.25)
                                         fxBurst()
-                                elseif targetDist > 22 and spamActive then
+                                elseif spamActive
+                                        and (targetDist > 22 or protected) then
                                         spamActive = false
+                                        spamCooldownUntil = os.clock() + 0.6
                                         pushStatus("Spam released", 0.8)
                                 end
+                        elseif spamActive then
+                                -- ball went to someone else -> stop instantly
+                                spamActive = false
+                                spamCooldownUntil = os.clock() + 0.6
                         end
                 elseif spamActive then
                         spamActive = false
+                        spamCooldownUntil = os.clock() + 0.6
                 end
-                if spamActive and os.clock() - lastSpamAt >= 0.015 then
+                -- fires: 0.09 s throttle + hard cap 14 per engagement
+                if spamActive and spamFires < 14
+                        and os.clock() - lastSpamAt >= 0.09
+                        and os.clock() - lastAutoFireAt >= 0.09 then
                         lastSpamAt = os.clock()
+                        lastAutoFireAt = os.clock()
                         if fireParryRemote(getCurveCFrame()) then
                                 spamFireCount = spamFireCount + 1
+                                spamFires = spamFires + 1
+                                if spamFires >= 14 then
+                                        spamActive = false
+                                        spamCooldownUntil = os.clock() + 1
+                                end
                         end
                 end
 
@@ -2225,10 +2264,15 @@ renderConn = RunService.RenderStepped:Connect(function()
                                 local zoomies = ball:FindFirstChild("zoomies")
                                 if zoomies then
                                         local target = ball:GetAttribute("target")
-                                        if lastTargetOf[ball] ~= target then
+                                        -- v26.3: reset parry state ONLY on a real
+                                        -- target change — nil-flicker must not
+                                        -- re-arm the parry (burst-fire bug)
+                                        if target ~= nil
+                                                and lastTargetOf[ball] ~= target then
                                                 lastTargetOf[ball] = target
                                                 parriedUntil = 0
                                                 parryRetries = 0
+                                                lastTtiBucket = -1
                                         end
                                         local speed, serverPos
                                         if framePhys then
@@ -2269,8 +2313,10 @@ renderConn = RunService.RenderStepped:Connect(function()
                                         local proxHit = nearDist <= accuracy
                                                 and (speed < 140 or nearDist < 70)
                                         -- PANIC: contact in < ~0.15 s — curve veto ignored
+                                        -- (v26.3: lateral tightened — panicking at balls
+                                        -- passing far to the side was a kill-risk)
                                         local panic = tti <= fireTti * 0.45
-                                                and lateral <= hitRadius * 3
+                                                and lateral <= hitRadius * 1.5
                                         local blocked = deathActive or infActive
                                                 or ball:FindFirstChild("ComboCounter") ~= nil
                                                 or root:FindFirstChild("SingularityCape") ~= nil
@@ -2279,16 +2325,20 @@ renderConn = RunService.RenderStepped:Connect(function()
                                                 and not blocked
 
                                         if armed and (ttiHit or proxHit)
-                                                and not isCurved(ball, pingSec) then
+                                                and not isCurved(ball, pingSec)
+                                                and os.clock() - lastAutoFireAt >= 0.08 then
+                                                lastAutoFireAt = os.clock()
                                                 parriedUntil = os.clock() + parryCooldown(speed)
                                                 parryRetries = math.min(parryRetries + 1, 4)
                                                 lastTtiBucket = -1
                                                 fxBurst()
                                                 fireSelected()
                                                 setBaseStatus("TTI PARRY")
-                                        elseif armed and panic and parryRetries < 4 then
+                                        elseif armed and panic and parryRetries < 4
+                                                and os.clock() - lastAutoFireAt >= 0.08 then
                                                 -- last-resort refire: contact imminent, the
                                                 -- curve veto no longer outranks survival
+                                                lastAutoFireAt = os.clock()
                                                 parriedUntil = os.clock()
                                                         + parryCooldown(speed) * 0.6
                                                 parryRetries = parryRetries + 1
