@@ -1,9 +1,34 @@
-# Blade Ball — BYAKUGAN RS27.2 (Audi RS × iOS 26 Fluid)
+# Blade Ball — BYAKUGAN RS27.3 (Audi RS × iOS 26 Fluid)
 
 Mobile auto-parry for **Roblox Blade Ball**, built for **Delta iOS**.
 The original **RS HUD** is back — Tango Red / Carbon Audi look — rebuilt with
 iOS 26 liquid-glass motion: spring bounces, elastic pops, fluid steppers,
 parry shockwaves, a Dynamic Island and an animated boot sequence.
+
+**v27.3 — SPHERE TRIGGER + SMART SPAM (rebuild, user spec):**
+- **the TTI/proximity trigger is replaced by a uniform sphere around
+  you**: `R = (15 + √speed + speed × (2×ping + 0.06)) / 2`, clamped
+  **15 → 50 studs** — starting 15, max 50, √ growth so a 900 stud/s
+  ball can't make it giant. A sphere is uniform: it catches curves a
+  box misses and reads the same from every angle
+- **touch is measured on the ball's flight path every frame** — the
+  path must pass inside the sphere within its lead time. Same result
+  as a continuous touch test, but mobile frame drops can never tunnel
+  past the sphere between two frames
+- **the lead = the sphere's own crossing time** (`R / speed`), floored
+  at the packet's send lead (`2×ping + 0.1`): a fast ball fires
+  slightly BEFORE touching the sphere so the packet still lands
+  before contact. NEURA's learned bias shifts this lead ±0.12 s
+- **`isBallTargetting()` gate**: the sphere fires ONLY when the ball
+  is locked on you — knockback/deflection pinballs grazing the sphere
+  never double-click the remote
+- **spam is no longer blind**: a vertical band (±3.1 studs around
+  your root = your character height) gates it. A curve lifting the
+  ball over your head (or dipping it under your feet) makes spam HOLD
+  instantly — the sphere parry takes the shot — and spam resumes the
+  moment the ball is back in band
+- the parry METHOD is untouched: same NAZK hook replay, same packet,
+  same curve CFrame
 
 **v27.2 — PANIC REMOVED + SPAM RETUNE (user diagnosis):**
 - **the last double was a fast curve — and it was PANIC, not the curve
@@ -233,7 +258,7 @@ the extrapolated server ball in real time.
 ### v27.0 — NEURA timing bias (optional, ON by default)
 
 ```
-fireWindow = ttiFireWindow(speed) + neuraBias          (v27.0)
+sphereLead = max(R/speed, 2×ping + 0.1) + neuraBias        (v27.3)
 neuraBias  = 0.12 × tanh( MLP( ball-vs-hitbox geometry ) )   ±0.12 s
 trained on: label = fire − resolve + 2 × ping   (one SGD step / approach)
 resolve    = velocity flip (> 72°/frame) = redirect landed,
@@ -242,19 +267,23 @@ resolve    = velocity flip (> 72°/frame) = redirect landed,
 
 - output is **exactly 0** until the first resolved approach — boot behavior
   identical to v26.9
-- the bias shifts the whole TTI fire window, which
+- the bias shifts the sphere's lead time, which
   is the point: it is a learned correction of YOUR end-to-end latency
 
-### v26.1 — time-to-impact interception (long range, high speed)
+### v27.3 — sphere trigger (replaces the TTI window)
 
 ```
-tti      = along-path distance / speed          (closest point on flight path,
-                                                 measured from the REAL ball — v26.4)
-lateral  = miss-distance of the path from you
-fire when  tti ≤ fireWindow  AND  lateral ≤ hitRadius
-fireWindow = clamp(offset/2 + 0.05 + speed/6000, 0.08, 0.42)   (v26.4: pure send lead)
-proximity fallback uses REAL distance only (v26.4)
+R        = (15 + sqrt(speed) + speed × (2×ping + 0.06)) / 2   clamped 15..50
+lead     = max(R / speed, 2×ping + 0.1)  capped 0.5 s  (+ NEURA bias)
+fire when  tti ≤ lead  AND  lateral ≤ R      (path-touch, every frame)
+gate     = isBallTargetting() — the ball must be locked on YOU
 ```
+
+- `tti` / `lateral` are still the closest-point-on-path numbers measured
+  from the REAL ball (v26.4) — the sphere replaces the old window + hit
+  radius. The delay term converts ping to studs at the ball's own
+  speed; the lead floor stops fast balls from being parried after
+  contact
 
 ### v26.6 — PREDICT (optional)
 
@@ -278,14 +307,14 @@ fireWindow unchanged — predict adds lead on the MEASUREMENT side only,
 - **No panic refire (v27.2)** — the old last-chance refire was the one
   branch that could double-fire an approach; it is removed entirely and a
   miss now recovers via the (wider) AUTO SPAM window.
-- **Proximity fallback** — the old radius trigger still handles slow/close
-  balls (trusted under 140 stud/s, or inside 70 studs).
 
 ## Auto spam
 
 ```
 distance(ball → you) ≤ 13 studs  →  spam ENGAGES (hook replays, 0.03 s apart)
 distance(ball → you) > 16 studs  →  spam releases (hysteresis)
+ball height outside ±3.1 studs of root (over head / under feet)
+                                 →  spam HOLDS — the sphere parry takes it
 ```
 
 Pure proximity — targeting is ignored entirely (a flickering target
@@ -306,7 +335,7 @@ envelope), then a 1 s cooldown.
 | CURVE MODE | `Camera · Random · Accelerated · Backwards · Slow · High · Normal · Speed · Down · Left · Right` |
 | PREDICT | Future-ball lead: `OFF · 25% · 50% · 75% · 100%` of the parry offset (default OFF) |
 | ROTATION | Rotation-curve prediction from the steering player's yaw rate (default ON; needs PREDICT to act) |
-| NEURA | Self-learning timing net: watches ball vs your hitbox and shifts the fire window ±0.12 s to your latency (default ON) |
+| NEURA | Self-learning timing net: watches ball vs your hitbox and shifts the sphere's lead ±0.12 s to your latency (default ON) |
 
 Stats strip: **PING · BALL SPD · RADIUS · OFFSET** (live parry time offset).
 Diagnostics: `RESCAN TOKEN` / `RE-ARM HOOK` buttons + token/capture caption.
@@ -322,7 +351,7 @@ Close (`×`) unloads the script completely.
 | `PRY NO GETGC` | Executor lacks `getgc` — hook replay unavailable, use Button method |
 | Capture never arms | Tap block once manually so the game sends the real packet |
 | Parries feel early/late | Watch the OFFSET stat — it is `2×(pings + machine delay)` by design; v26.4 fixed the double-counted lead, so fires now land ~`1×(pings+machine)` before contact |
-| Dies at long range / high speed | Fixed in v26.1 — TTI trigger. Watch the island: it shows live `TTI 0.xx` countdown when targeted |
+| Dies at long range / high speed | Fixed in v26.1 + v27.3 — the sphere's send-lead floor keeps fast balls fireable at range (fired before touch, never after contact). Watch the island: it shows live `TTI 0.xx` countdown when targeted |
 | Fires when the ball is far away | Fixed in v26.4 — the trigger used the time-extrapolated ball and read it as "close"; it now measures the real ball only |
 | Parries too early with PREDICT on | PREDICT adds extra lead on top of the v26.4 window by design — step it down (50% → 25%) or set OFF; OFF is the v26.5 timing exactly |
 | Curved balls still parry late (pre-v26.8 behavior) | Turn PREDICT on (25–50%) and keep ROTATION ON — the steerer's yaw rate leads the curve so TTI can fire during the bend. If a friend's curves predict the wrong side, flip ROTATION OFF and report it — the turn-side gain is tunable |
