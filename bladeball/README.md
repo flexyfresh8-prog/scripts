@@ -1,9 +1,29 @@
-# Blade Ball — BYAKUGAN RS27.3 (Audi RS × iOS 26 Fluid)
+# Blade Ball — BYAKUGAN RS27.4 (Audi RS × iOS 26 Fluid)
 
 Mobile auto-parry for **Roblox Blade Ball**, built for **Delta iOS**.
 The original **RS HUD** is back — Tango Red / Carbon Audi look — rebuilt with
 iOS 26 liquid-glass motion: spring bounces, elastic pops, fluid steppers,
 parry shockwaves, a Dynamic Island and an animated boot sequence.
+
+**v27.4 — MODE CHOICE + VISIBLE SPHERE (user request):**
+- **on load the script asks: sphere mode or timer mode** — a glass card
+  pops up ~2 s after boot with two big buttons (**SPHERE** / **TIMER**);
+  whichever the user picks is used. No touch for 9 s keeps the default
+  **SPHERE**. The menu **PARRY MODE** row re-chooses any time and the
+  boot card keeps the row label in sync
+- **TIMER mode = the classic v26.4/v27.2 trigger restored verbatim**:
+  `ttiFireWindow` send lead (`offset/2 + 0.05 + speed/6000`, clamped
+  `0.08–0.42 s`), hit radius `max(accuracy×0.55, 12)`, plus the
+  real-distance proximity fallback — same fire, NEURA bias on the window
+  exactly as before
+- **SPHERE mode now renders the live hitbox**: a red **ForceField bubble**
+  centered on your character, **resized every frame** to the current
+  sphere radius (15–50 studs as the ball speeds up / slows down). It is
+  client-side only (zero physics, one anchored part), hidden in timer
+  mode, on unload, and whenever AUTO PARRY is off
+- the parry METHOD stays untouched: same NAZK hook replay, same 8-arg
+  packet. Spam vertical band, `isBallTargetting()` gate and the
+  once-per-approach gate are identical in both modes
 
 **v27.3 — SPHERE TRIGGER + SMART SPAM (rebuild, user spec):**
 - **the TTI/proximity trigger is replaced by a uniform sphere around
@@ -270,7 +290,26 @@ resolve    = velocity flip (> 72°/frame) = redirect landed,
 - the bias shifts the sphere's lead time, which
   is the point: it is a learned correction of YOUR end-to-end latency
 
-### v27.3 — sphere trigger (replaces the TTI window)
+### v27.4 — two trigger modes (asked at boot)
+
+```
+SPHERE mode  R     = (15 + sqrt(speed) + speed × (2×ping + 0.06)) / 2  clamped 15..50
+             lead   = max(R / speed, 2×ping + 0.1)  capped 0.5 s  (+ NEURA bias)
+             fire    tti ≤ lead  AND  lateral ≤ R          (+ visible bubble)
+
+TIMER mode   window = offset/2 + 0.05 + speed/6000   clamped 0.08..0.42 s
+             radius = max(accuracy × 0.55, 12)
+             fire    (tti ≤ window AND lateral ≤ radius)
+                     OR (nearDist ≤ accuracy AND (speed < 140 OR nearDist < 70))
+
+both         gate   = isBallTargetting() — the ball must be locked on YOU
+```
+
+- the mode is picked on the boot card (default **SPHERE** if untouched for
+  9 s) and re-pickable any time on the **PARRY MODE** menu row — the island
+  status shows which one fired (`SPHERE PARRY` / `TTI PARRY` / `PREDICT PARRY`)
+
+### v27.3 — sphere trigger (the default)
 
 ```
 R        = (15 + sqrt(speed) + speed × (2×ping + 0.06)) / 2   clamped 15..50
@@ -314,7 +353,7 @@ fireWindow unchanged — predict adds lead on the MEASUREMENT side only,
 distance(ball → you) ≤ 13 studs  →  spam ENGAGES (hook replays, 0.03 s apart)
 distance(ball → you) > 16 studs  →  spam releases (hysteresis)
 ball height outside ±3.1 studs of root (over head / under feet)
-                                 →  spam HOLDS — the sphere parry takes it
+                                 →  spam HOLDS — the sphere/timer parry takes it
 ```
 
 Pure proximity — targeting is ignored entirely (a flickering target
@@ -331,6 +370,7 @@ envelope), then a 1 s cooldown.
 | PARRY SHOCKWAVE | Screen-edge glow + island ring on every parry |
 | BYAKUGAN AURA | Red character highlight |
 | SERVER DOT | Yellow server-ball prediction dot |
+| PARRY MODE | `SPHERE · TIMER` — trigger geometry (also asked on the boot card; default SPHERE) |
 | PARRY METHOD | `Auto (Smart) · Hook Replay · Button · Firesignal · Remote` |
 | CURVE MODE | `Camera · Random · Accelerated · Backwards · Slow · High · Normal · Speed · Down · Left · Right` |
 | PREDICT | Future-ball lead: `OFF · 25% · 50% · 75% · 100%` of the parry offset (default OFF) |
@@ -346,7 +386,8 @@ Close (`×`) unloads the script completely.
 
 | Symptom | Fix |
 | --- | --- |
-| Stuck at `booting…` / boot card % never finishes (v26.4 and older) | Fixed in v26.5 — the PRY scan used to freeze the whole game on big servers, and a dead animation thread could leave the boot card up forever. The scan now yields and a 9 s failsafe force-finishes the boot. Check the pill: it must say **`RS26.5`** — if it still says `RS26.4` you are running a stale cached build (fully close Roblox, re-execute) |
+| Stuck at `booting…` / boot card % never finishes (v26.4 and older) | Fixed in v26.5 — the PRY scan used to freeze the whole game on big servers, and a dead animation thread could leave the boot card up forever. The scan now yields and a 9 s failsafe force-finishes the boot. Check the pill: it must say **`RS27.4`** — if it still says an older build you are running a stale cached copy (fully close Roblox, re-execute, and add `?v=274` to the loadstring URL) |
+| No mode card / picked the wrong mode | The **CHOOSE PARRY MODE** card pops ~2 s after boot; ignoring it for 9 s keeps **SPHERE**. You can flip modes any time on the **PARRY MODE** menu row — no re-execute needed |
 | Executed, nothing popped up | The green `[BYAK 1/6] → [BYAK ✓]` tracer pill top-center shows the live boot stage at all times. **No pill at all** → the fetch failed (check Delta console, re-execute, or GitHub rate-limited — wait a minute). **Pill turns red** → it prints the exact error — screenshot it and send it back. Plain build = real Lua errors in the Delta console too |
 | `PRY NO GETGC` | Executor lacks `getgc` — hook replay unavailable, use Button method |
 | Capture never arms | Tap block once manually so the game sends the real packet |
