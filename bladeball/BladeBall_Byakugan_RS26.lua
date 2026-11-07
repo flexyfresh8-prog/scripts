@@ -1,5 +1,5 @@
 -- ============================================================
--- Blade Ball Mobile — BYAKUGAN RS27.2  (Audi RS × iOS 26 Fluid)
+-- Blade Ball Mobile — BYAKUGAN RS27.3  (Audi RS × iOS 26 Fluid)
 -- ============================================================
 -- UI   : the original RS HUD is back — same Tango Red / Carbon
 --        Audi look, rebuilt with iOS 26 liquid-glass motion:
@@ -17,26 +17,32 @@
 --        parry_time_offset = 2 x (playerPing + clientPing
 --                                    + machineDelay)
 --        applied to extrapolate the SERVER-side ball position.
--- LONG-RANGE HS (v26.1) — time-to-impact interception:
---        1. Second-order extrapolation: velocity ACCELERATION
---           is tracked per-frame, server ball = pos + vel*t
---           + 0.5*acc*t^2 (curved flight, not a straight lie).
---        2. Path/TTI trigger: closest-point-on-path math —
---           lateral miss-distance + time-to-impact along the
---           ball's flight path. Fires when TTI <= fire window
---           (offset + margin + speed spread). Frame-rate and
---           DISTANCE independent — no more dying at 400 studs.
---        3. Curve-veto cap: other players' parries can only
---           block your parry max 1.2 s, no matter the range.
---        4. Adaptive cooldown: 0.72 s at slow balls down to
---           0.16 s at 800+ studs/s — and NO panic refire: the
---           TTI branch fires exactly ONCE per approach, a
---           second packet is how doubles happened (v27.2).
+-- PARRY TRIGGER (v27.3 SPHERE — user spec):
+--        1. Second-order extrapolation unchanged: server ball =
+--           pos + vel*t + 0.5*acc*t^2 (curved flight tracked).
+--        2. SPHERE TRIGGER: a uniform sphere around US. Radius
+--           scales with the ball's velocity — starting 15 studs,
+--           max 50:
+--             R = (15 + sqrt(speed) + speed*(2*ping + 0.06)) / 2
+--           (sqrt growth tames the giant-sphere problem; the
+--           delay term converts ping to studs at the ball's own
+--           speed). Touch = the ball's FLIGHT PATH passes inside
+--           the sphere — re-measured EVERY frame, so curves are
+--           caught and mobile frame drops cannot tunnel past it.
+--        3. isBallTargetting(): the sphere fires ONLY when the
+--           ball is locked on us — knockback/deflection pinballs
+--           grazing the sphere can never double-fire.
+--        4. Curve veto + adaptive cooldown + once-per-approach
+--           gate kept exactly as they were.
 -- AUTO SPAM:
 --        proximity-only: the ball within 13 studs of YOU -> spam
 --        ENGAGES (rapid hook-replay fires, 0.03 s apart) and
 --        releases above 16 studs (hysteresis, no flicker) —
---        regardless of who the ball is targeting.
+--        regardless of who the ball is targeting. v27.3: a
+--        vertical band gates it — if the ball is curved OVER our
+--        head or UNDER our feet (outside our character height)
+--        spam HOLDS and the sphere parry takes the shot until
+--        the ball is back in band.
 -- Boot-safety: UI builds FIRST, no infinite waits, every error
 --        shows a visible red panel instead of silent death.
 -- v26.2 — SMOOTH + MINIMAL:
@@ -211,6 +217,36 @@
 --        · spam "a bit too fast": throttle 0.02 -> 0.03 s
 --          (~50 -> ~33 packets/s), cap 30 kept — the saturation
 --          envelope stretches 0.6 -> 0.9 s
+-- v27.3 — SPHERE TRIGGER + SMART SPAM (rebuild, user spec):
+--        · the TTI/proximity trigger is REPLACED by a uniform
+--          sphere around us: radius = (15 + sqrt(speed) +
+--          speed*(2*ping + 0.06)) / 2, clamped 15..50 studs —
+--          starting 15, max 50, sqrt growth so a 900 stud/s
+--          ball cannot make it giant. A sphere is uniform: it
+--          catches curves a box/radius misses and reads the
+--          same from every angle
+--        · touch is measured on the ball's FLIGHT PATH every
+--          frame (path passes inside the sphere within its
+--          lead time) — continuous-touch accuracy without
+--          mobile frame-drop tunneling. The lead is the
+--          sphere's own crossing time floored at the packet
+--          send lead (2*ping + 0.1): a fast ball fires slightly
+--          BEFORE touching the sphere so the packet still
+--          lands first
+--        · isBallTargetting(): the sphere only fires when the
+--          ball targets US — knockback pinballs grazing the
+--          sphere never double-click the remote
+--        · SPAM no longer fires blindly: a vertical band
+--          (+-3.1 studs around the root = our character
+--          height) gates it. A skilled curve lifting the ball
+--          over our head (or dipping it under our feet) makes
+--          spam HOLD instantly — the sphere parry takes the
+--          shot — and spam resumes the moment the ball is
+--          back in band
+--        · the parry METHOD is untouched: same NAZK hook
+--          replay, same packet, same curve CFrame. NEURA /
+--          PREDICT / ROTATION all keep working (NEURA's bias
+--          now shifts the sphere's lead time)
 -- ============================================================
 
 -- ============================================================
@@ -561,6 +597,25 @@ end
 -- observer latches that same flip on its own for training. One
 -- less per-frame scan, six fewer main-chunk locals.
 -- ============================================================
+
+-- ============================================================
+-- v27.3 SPHERE TRIGGER helpers — main-chunk upvalues (the xpcall
+-- body sits at its 200-local limit; body code only calls these).
+-- ============================================================
+-- spamHold: spam suspends while the ball is curved over/under
+-- our character (outside the vertical band) — the sphere parry
+-- owns the shot until the ball is back in band.
+local spamHold = false
+-- isBallTargetting: the sphere fires ONLY when the ball is locked
+-- on us. Deflected balls and knockback pinballs grazing the
+-- sphere are ignored — no double clicks into the game's parry
+-- cooldown (user spec).
+local function isBallTargetting(ball)
+        local t = ball and ball:GetAttribute("target")
+        if not t then return false end
+        local lp = game:GetService("Players").LocalPlayer
+        return t == lp.Name
+end
 
 xpcall(function()
 
@@ -1112,17 +1167,9 @@ local function serverBallPos(ball, zoomies, offset)
         return ball.Position + vel * offset + acc * (offset * offset * 0.5), acc
 end
 
--- Fire window: how many seconds BEFORE impact we release the
--- parry so the request lands inside the server's validation
--- window. v26.4: the trigger measures the REAL ball now (the
--- phantom-ball subtraction is gone), so the window must be the
--- pure send lead = 1 x (pings + machine) — HALF the offset
--- formula. Its other half used to hide inside the phantom
--- subtraction, double-counting the lead (fires ~1 s early).
-local function ttiFireWindow(speed)
-        local w = getParryTimeOffset() * 0.5 + 0.05 + speed / 6000
-        return math.clamp(w, 0.08, 0.42)
-end
+-- (v27.3: the old ttiFireWindow send-lead window is gone — the
+-- sphere trigger carries its own lead: the sphere's crossing
+-- time floored at the packet's send lead, see SPHERE TRIGGER.)
 
 -- Adaptive cooldown: fast balls re-arm FAST so the next
 -- approach after a redirect is covered; slow balls stay quiet.
@@ -1618,7 +1665,7 @@ create("TextLabel", {
 create("TextLabel", {
         Size = UDim2.new(1, -120, 0, 12), Position = UDim2.new(0, 56, 0, 27),
         BackgroundTransparency = 1,
-        Text = "RS27.2 · NEURA · PREDICT · PERF",
+        Text = "RS27.3 · NEURA · PREDICT · PERF",
         Font = Enum.Font.GothamBold, TextSize = 8,
         TextColor3 = THEME.TextDim, TextXAlignment = Enum.TextXAlignment.Left,
         Parent = header, ZIndex = 3,
@@ -2307,7 +2354,10 @@ end)
 
 makeSwitchRow("AUTO SPAM <13", autoSpamEnabled, function(v)
         autoSpamEnabled = v
-        if not v then spamActive = false end
+        if not v then
+                spamActive = false
+                spamHold = false
+        end
         pushStatus(v and "Auto spam armed" or "Auto spam off", 1.2)
 end)
 
@@ -2764,14 +2814,27 @@ renderConn = RunService.RenderStepped:Connect(function()
                 -- hovering ball was redirecting it into us and getting
                 -- us killed (v26.3 lesson kept).
                 -- v27.2: engage 10 -> 13 studs, release 14 -> 16
-                -- (hysteresis kept) — with PANIC gone, spam is also
-                -- the safety net for a missed TTI fire, so the
-                -- window grows.
+                -- (hysteresis kept).
+                -- v27.3 VERTICAL BAND: spam no longer fires blindly —
+                -- if the ball is curved OVER our head or UNDER our
+                -- feet (outside +-3.1 studs of root Y = our character
+                -- height), spam HOLDS (no fires) and the sphere parry
+                -- takes the shot; the moment the ball is back in
+                -- band, spam resumes. The hold also clears the
+                -- once-per-approach arm so the sphere can fire
+                -- immediately.
                 if autoSpamEnabled and ball and root
                         and not deathActive and not infActive then
                         local distUs = (root.Position - ball.Position).Magnitude
                         local protected = root:FindFirstChild("SingularityCape") ~= nil
                                 or ball:FindFirstChild("ComboCounter") ~= nil
+                        local inBand = math.abs(
+                                ball.Position.Y - root.Position.Y) <= 3.1
+                        spamHold = spamActive and not inBand
+                        if spamHold then
+                                -- hand the approach to the sphere parry
+                                lastFireInfo = nil
+                        end
                         if not spamActive then
                                 if os.clock() >= spamCooldownUntil
                                         and distUs <= 13 and not protected then
@@ -2783,23 +2846,27 @@ renderConn = RunService.RenderStepped:Connect(function()
                                 end
                         elseif distUs > 16 or protected then
                                 spamActive = false
+                                spamHold = false
                                 spamCooldownUntil = os.clock() + 0.6
                                 pushStatus("Spam released", 0.8)
                         end
                 elseif spamActive then
                         spamActive = false
+                        spamHold = false
                         spamCooldownUntil = os.clock() + 0.6
+                else
+                        spamHold = false
                 end
                 -- fires: 0.03 s throttle (~33/s) + cap 30 per engagement
-                -- (v27.2 "a bit too fast": 0.02 -> 0.03 s, cap kept —
-                -- the saturation envelope stretches 0.6 -> 0.9 s)
-                if spamActive and spamFires < 30
+                -- (v27.2) — v27.3: never while the ball is outside the
+                -- vertical band (spamHold)
+                if spamActive and not spamHold and spamFires < 30
                         and os.clock() - lastSpamAt >= 0.03
                         and os.clock() - lastAutoFireAt >= 0.03 then
                         lastSpamAt = os.clock()
                         lastAutoFireAt = os.clock()
                         -- v26.7: spam shots also arm the anti-double gate,
-                        -- so the TTI branch cannot stack a wasted packet
+                        -- so the sphere branch cannot stack a wasted packet
                         -- on top of an engagement that is already firing
                         lastFireInfo = { ball = ball, t = os.clock(),
                                 vel = ballVelocity(ball),
@@ -2896,26 +2963,46 @@ renderConn = RunService.RenderStepped:Connect(function()
                                                         lateral = (rel - dir * along).Magnitude
                                                 end
                                         end
-                                        -- v27.0 NEURA: learned +-0.12 s
-                                        -- timing bias on the fire window;
-                                        -- exactly 0 until the net has live
-                                        -- outcome samples (zero-init)
-                                        local fireTti = ttiFireWindow(speed)
+                                        -- v27.3 SPHERE TRIGGER (user spec) — a
+                                        -- uniform sphere around us; fire when
+                                        -- the ball's flight path passes inside
+                                        -- it. Radius: base 15, sqrt(velocity)
+                                        -- growth, ping+delay compensated (the
+                                        -- delay converted to studs at the
+                                        -- ball's own speed), clamped 15..50:
+                                        --   R = (15 + sqrt(speed)
+                                        --        + speed*(2*ping + 0.06)) / 2
+                                        local sphereR = math.clamp((15
+                                                + math.sqrt(speed)
+                                                + speed * (pingSec * 2 + 0.06))
+                                                / 2, 15, 50)
+                                        -- touch lead: the sphere's own crossing
+                                        -- time (R/speed), floored at the packet's
+                                        -- send lead (2*ping + 0.1 — a fast ball
+                                        -- must be fired BEFORE touch or the
+                                        -- packet lands after contact), capped
+                                        -- 0.5 s like the old window. NEURA's
+                                        -- learned latency bias still shifts it.
+                                        local sphereT = math.min(math.max(
+                                                sphereR / math.max(speed, 1),
+                                                pingSec * 2 + 0.1), 0.5)
                                                 + neuraBias(root, ball,
                                                         framePhys, vel,
                                                         speed, tti, lateral,
                                                         pingSec)
-                                        local hitRadius = math.max(accuracy * 0.55, 12)
-                                        local ttiHit = tti <= fireTti and lateral <= hitRadius
-                                        -- proximity fallback — v26.4: REAL distance only.
-                                        -- distServer is the ball pushed `offset` seconds
-                                        -- into its own future; using it here let a 250-stud
-                                        -- ball read as "10 studs" and fire across the map.
+                                        -- frame-rate independent touch: the
+                                        -- path must pass INSIDE the sphere
+                                        -- (lateral) and reach it within the
+                                        -- lead (tti) — identical result to a
+                                        -- continuous touch test, but mobile
+                                        -- frame drops can never tunnel past
+                                        -- the sphere between two frames
+                                        local sphereHit = tti <= sphereT
+                                                and lateral <= sphereR
+                                        -- kept for the "Getting close" status
                                         local nearDist = predictPct > 0
                                                 and (root.Position - measPos).Magnitude
                                                 or distReal
-                                        local proxHit = nearDist <= accuracy
-                                                and (speed < 140 or nearDist < 70)
                                         -- v27.2: PANIC refire REMOVED. On a fast
                                         -- curve the redirect can flip in steps the
                                         -- dot < 0.3 latch reads as steering, the
@@ -2924,14 +3011,18 @@ renderConn = RunService.RenderStepped:Connect(function()
                                         -- (tti <= half window, lateral <= 1.5x
                                         -- radius) is EXACTLY a fast curve's
                                         -- signature — fired the second packet.
-                                        -- With it gone the TTI branch is the only
+                                        -- With it gone the sphere branch is the only
                                         -- auto fire that can ever touch a targeted
                                         -- approach: exactly ONE packet.
                                         local blocked = deathActive or infActive
                                                 or ball:FindFirstChild("ComboCounter") ~= nil
                                                 or root:FindFirstChild("SingularityCape") ~= nil
+                                        -- v27.3: isBallTargetting() gate — the
+                                        -- sphere fires ONLY on a ball locked on
+                                        -- us (deflection/knockback pinballs
+                                        -- grazing the sphere never double-fire)
                                         local armed = os.clock() >= parriedUntil
-                                                and target == LocalPlayer.Name
+                                                and isBallTargetting(ball)
                                                 and not blocked
 
                                         -- v26.7 ANTI-DOUBLE-PARRY: after an auto fire
@@ -2955,7 +3046,7 @@ renderConn = RunService.RenderStepped:Connect(function()
                                                 and target == lastFireInfo.target
                                                 and os.clock() - lastFireInfo.t <= 1.2
 
-                                        if armed and (ttiHit or proxHit)
+                                        if armed and sphereHit
                                                 and not sameApproach
                                                 -- v26.8: the curve veto relaxes only when
                                                 -- the ROTATION predictor is leading the
@@ -2989,7 +3080,7 @@ renderConn = RunService.RenderStepped:Connect(function()
                                         elseif target == LocalPlayer.Name then
                                                 if blocked then
                                                         setBaseStatus("PROTECTED")
-                                                elseif tti < math.huge and tti <= fireTti + 0.6 then
+                                                elseif tti < math.huge and tti <= sphereT + 0.6 then
                                                         -- quantized to 0.1 s steps: no string
                                                         -- garbage every frame (mobile GC lag)
                                                         local bucket = math.floor(tti * 10)
