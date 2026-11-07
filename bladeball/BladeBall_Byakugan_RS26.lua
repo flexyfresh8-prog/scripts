@@ -1,5 +1,5 @@
 -- ============================================================
--- Blade Ball Mobile — BYAKUGAN RS27.3  (Audi RS × iOS 26 Fluid)
+-- Blade Ball Mobile — BYAKUGAN RS27.4  (Audi RS × iOS 26 Fluid)
 -- ============================================================
 -- UI   : the original RS HUD is back — same Tango Red / Carbon
 --        Audi look, rebuilt with iOS 26 liquid-glass motion:
@@ -17,7 +17,7 @@
 --        parry_time_offset = 2 x (playerPing + clientPing
 --                                    + machineDelay)
 --        applied to extrapolate the SERVER-side ball position.
--- PARRY TRIGGER (v27.3 SPHERE — user spec):
+-- PARRY TRIGGER (v27.4 — SPHERE or TIMER, asked at boot):
 --        1. Second-order extrapolation unchanged: server ball =
 --           pos + vel*t + 0.5*acc*t^2 (curved flight tracked).
 --        2. SPHERE TRIGGER: a uniform sphere around US. Radius
@@ -34,6 +34,14 @@
 --           grazing the sphere can never double-fire.
 --        4. Curve veto + adaptive cooldown + once-per-approach
 --           gate kept exactly as they were.
+--        5. v27.4 MODE CHOICE: on load the script ASKS — sphere
+--           mode or timer mode — and uses whichever the user
+--           picks (the menu PARRY MODE row re-chooses any time).
+--           TIMER = the classic v26.4/v27.2 TTI send-lead
+--           window + proximity fallback, restored verbatim.
+--        6. v27.4 VISIBLE SPHERE: in sphere mode the live hitbox
+--           renders as a red ForceField bubble around our
+--           character, resized every frame with the radius.
 -- AUTO SPAM:
 --        proximity-only: the ball within 13 studs of YOU -> spam
 --        ENGAGES (rapid hook-replay fires, 0.03 s apart) and
@@ -247,6 +255,24 @@
 --          replay, same packet, same curve CFrame. NEURA /
 --          PREDICT / ROTATION all keep working (NEURA's bias
 --          now shifts the sphere's lead time)
+-- v27.4 — MODE CHOICE + VISIBLE SPHERE (user request):
+--        · on load the script ASKS: sphere mode or timer mode —
+--          whichever the user picks is used (a 9 s no-touch keeps
+--          SPHERE; the menu PARRY MODE row re-chooses any time,
+--          and the boot card keeps the row label in sync)
+--        · TIMER mode = the classic v26.4/v27.2 trigger restored
+--          VERBATIM: ttiFireWindow send lead (half the offset
+--          formula + speed ramp, clamp 0.08..0.42), accuracy
+--          radius max(accuracy*0.55, 12), real-distance proximity
+--          fallback — same fire, same NEURA bias on the window
+--        · SPHERE mode now RENDERS the live hitbox: a red
+--          ForceField bubble centered on the root, resized every
+--          frame to the current sphere radius (hidden in timer
+--          mode, on unload, and whenever auto parry is off)
+--        · the parry METHOD stays untouched: same NAZK hook
+--          replay, same 8-arg packet. Spam vertical band,
+--          isBallTargetting gate, once-per-approach gate: all
+--          identical in both modes
 -- ============================================================
 
 -- ============================================================
@@ -615,6 +641,61 @@ local function isBallTargetting(ball)
         if not t then return false end
         local lp = game:GetService("Players").LocalPlayer
         return t == lp.Name
+end
+
+-- ============================================================
+-- v27.4 PARRY MODE + VISIBLE SPHERE — main-chunk upvalues (the
+-- xpcall body sits at its 200-local limit; body code only calls
+-- these / assigns to them).
+-- ============================================================
+-- parryMode: which trigger geometry fires the parry — the
+-- v27.3 velocity-scaled SPHERE, or the classic TIMER (the
+-- v26.4/v27.2 TTI send-lead window + proximity fallback).
+-- Asked at boot (chooser card); changeable in the menu any time.
+local parryMode = "Sphere"
+-- sphereVisual: the visible hitbox bubble (sphere mode only).
+-- One local anchored Ball part, ForceField material, client-side
+-- only — zero physics cost, resized every frame with the radius.
+local sphereVisual = nil
+-- parryModeSync: the menu assigns this so the boot chooser can
+-- keep the PARRY MODE row's label (and step index) in sync.
+local parryModeSync = nil
+local function sphereVisShow(root, radius)
+        pcall(function()
+                if not (sphereVisual and sphereVisual.Parent) then
+                        local p = Instance.new("Part")
+                        p.Name = "ByakuganSphere"
+                        p.Shape = Enum.PartType.Ball
+                        p.Anchored = true
+                        p.CanCollide = false
+                        p.CanQuery = false
+                        p.CanTouch = false
+                        p.CastShadow = false
+                        p.Massless = true
+                        p.Material = Enum.Material.ForceField
+                        p.Color = Color3.fromRGB(255, 69, 58)
+                        p.Transparency = 0.5
+                        p.Size = Vector3.new(radius * 2, radius * 2, radius * 2)
+                        p.CFrame = CFrame.new(root.Position)
+                        p.Parent = workspace
+                        sphereVisual = p
+                        return
+                end
+                sphereVisual.Size = Vector3.new(radius * 2, radius * 2, radius * 2)
+                sphereVisual.CFrame = CFrame.new(root.Position)
+                sphereVisual.Transparency = 0.5
+        end)
+end
+local function sphereVisHide()
+        if sphereVisual and sphereVisual.Parent then
+                sphereVisual.Transparency = 1
+        end
+end
+local function sphereVisDestroy()
+        if sphereVisual then
+                pcall(function() sphereVisual:Destroy() end)
+                sphereVisual = nil
+        end
 end
 
 xpcall(function()
@@ -1167,9 +1248,20 @@ local function serverBallPos(ball, zoomies, offset)
         return ball.Position + vel * offset + acc * (offset * offset * 0.5), acc
 end
 
--- (v27.3: the old ttiFireWindow send-lead window is gone — the
--- sphere trigger carries its own lead: the sphere's crossing
--- time floored at the packet's send lead, see SPHERE TRIGGER.)
+-- (v27.3 note: the sphere trigger carries its own lead — the
+-- sphere's crossing time floored at the packet's send lead.)
+-- v27.4: the window is BACK as TIMER mode's trigger — restored
+-- verbatim from v26.4/v27.2 so the classic feel is identical.
+
+-- Fire window (TIMER mode): how many seconds BEFORE impact we
+-- release the parry so the request lands inside the server's
+-- validation window. The pure send lead = 1 x (pings + machine)
+-- — HALF the offset formula (the other half used to hide inside
+-- the phantom subtraction, double-counting the lead).
+local function ttiFireWindow(speed)
+        local w = getParryTimeOffset() * 0.5 + 0.05 + speed / 6000
+        return math.clamp(w, 0.08, 0.42)
+end
 
 -- Adaptive cooldown: fast balls re-arm FAST so the next
 -- approach after a redirect is covered; slow balls stay quiet.
@@ -1665,7 +1757,7 @@ create("TextLabel", {
 create("TextLabel", {
         Size = UDim2.new(1, -120, 0, 12), Position = UDim2.new(0, 56, 0, 27),
         BackgroundTransparency = 1,
-        Text = "RS27.3 · NEURA · PREDICT · PERF",
+        Text = "RS27.4 · NEURA · PREDICT · PERF",
         Font = Enum.Font.GothamBold, TextSize = 8,
         TextColor3 = THEME.TextDim, TextXAlignment = Enum.TextXAlignment.Left,
         Parent = header, ZIndex = 3,
@@ -1943,6 +2035,15 @@ local function makeStepperRow(labelText, options, startIndex, onPick)
         leftBtn.Activated:Connect(function() flashArrow(leftBtn) step(-1) end)
         rightBtn.Activated:Connect(function() flashArrow(rightBtn) step(1) end)
         row.Activated:Connect(function() step(1) end)
+        -- v27.4: the boot mode-chooser keeps this row's label (and
+        -- step index) in sync if it picks a mode before the menu
+        -- stepper is ever touched
+        if labelText == "PARRY MODE" then
+                parryModeSync = function(txt, wantIdx)
+                        if wantIdx then idx = wantIdx end
+                        valueLabel.Text = txt
+                end
+        end
         table.insert(animRows, row)
         return row
 end
@@ -2385,6 +2486,17 @@ makeSwitchRow("PERF MODE", perfMode, function(v)
         if v then islandPop(1.1) end
 end)
 
+-- v27.4: which trigger geometry fires the parry — the velocity-
+-- scaled sphere or the classic TTI timer. Also asked at boot.
+makeStepperRow("PARRY MODE",
+        { "SPHERE", "TIMER" }, parryMode == "Timer" and 2 or 1,
+        function(i, opt)
+                parryMode = (opt == "TIMER") and "Timer" or "Sphere"
+                if opt == "TIMER" then sphereVisDestroy() end
+                pushStatus(opt .. " parry trigger", 1.2)
+                islandPop(1.2)
+        end)
+
 makeStepperRow("PARRY METHOD",
         { "Auto (Smart)", "Hook Replay", "Button", "Firesignal", "Remote" }, 1,
         function(i, opt)
@@ -2422,6 +2534,78 @@ makeStepperRow("NEURA",
                 pushStatus(opt == "ON" and "Neura net on — learning live"
                         or "Neura net off", 1.2)
         end)
+
+-- ============================================================
+-- [16b] BOOT MODE CHOOSER (v27.4 user spec) — "sphere mode or
+-- timer mode?" asked right after boot; whichever the user picks
+-- is used. Untouched for 9 s keeps the default SPHERE. The menu
+-- PARRY MODE row re-chooses any time (kept in sync both ways).
+-- ============================================================
+task.delay(2.4, function()
+        local picked = false
+        local card = create("Frame", {
+                AnchorPoint = Vector2.new(0.5, 0),
+                Position = UDim2.new(0.5, 0, 0, 58),
+                Size = UDim2.fromOffset(300, 132),
+                BackgroundColor3 = THEME.Panel, BackgroundTransparency = 0.06,
+                BorderSizePixel = 0, Parent = screenGui, ZIndex = 60,
+        })
+        corner(card, 18)
+        stroke(card, THEME.Red, 1.4, 0.35)
+        create("TextLabel", {
+                Size = UDim2.new(1, -24, 0, 30), Position = UDim2.new(0, 12, 0, 10),
+                BackgroundTransparency = 1, Text = "CHOOSE PARRY MODE",
+                Font = Enum.Font.GothamBlack, TextSize = 16,
+                TextColor3 = THEME.Text, Parent = card, ZIndex = 61,
+        })
+        create("TextLabel", {
+                Size = UDim2.new(1, -24, 0, 30), Position = UDim2.new(0, 12, 0, 40),
+                BackgroundTransparency = 1, TextWrapped = true,
+                Text = "SPHERE = velocity-scaled hitbox bubble (visible)\nTIMER = classic TTI send-lead window",
+                Font = Enum.Font.Gotham, TextSize = 10,
+                TextColor3 = THEME.TextDim, Parent = card, ZIndex = 61,
+        })
+        local function pickMode(xOff, label, mode)
+                local b = create("TextButton", {
+                        Size = UDim2.fromOffset(132, 44),
+                        Position = UDim2.new(0, xOff, 1, -52),
+                        BackgroundColor3 = mode == "Sphere" and THEME.Red
+                                or THEME.PanelDark,
+                        Text = label, Font = Enum.Font.GothamBlack,
+                        TextSize = 13, TextColor3 = THEME.Text,
+                        AutoButtonColor = false, Parent = card, ZIndex = 61,
+                })
+                corner(b, 12)
+                pressScale(b, 0.9)
+                b.Activated:Connect(function()
+                        if picked then return end
+                        picked = true
+                        parryMode = mode
+                        if mode ~= "Sphere" then sphereVisDestroy() end
+                        if parryModeSync then
+                                parryModeSync(mode == "Timer" and "TIMER" or "SPHERE",
+                                        mode == "Timer" and 2 or 1)
+                        end
+                        pushStatus(mode .. " parry mode selected", 1.6)
+                        islandPop(1.3)
+                        fxBurst()
+                        tw(card, 0.22, { Position = UDim2.new(0.5, 0, 0, -150) },
+                                Enum.EasingStyle.Back, Enum.EasingDirection.In):Play()
+                        task.delay(0.24, function() card:Destroy() end)
+                end)
+                return b
+        end
+        pickMode(12, "SPHERE", "Sphere")
+        pickMode(156, "TIMER", "Timer")
+        -- decide-later: keep the default (SPHERE) and slide away
+        task.delay(9, function()
+                if not picked and card.Parent then
+                        tw(card, 0.3, { Position = UDim2.new(0.5, 0, 0, -150) },
+                                Enum.EasingStyle.Quad, Enum.EasingDirection.In):Play()
+                        task.delay(0.32, function() card:Destroy() end)
+                end
+        end)
+end)
 
 -- ============================================================
 -- [17] LIVE STATS STRIP + DIAGNOSTICS + FOOTER
@@ -2554,6 +2738,7 @@ unloadFn = function()
         end
         pcall(function() screenGui:Destroy() end)
         pcall(function() serverBallDot:Destroy() end)
+        pcall(function() sphereVisDestroy() end)
         local char = LocalPlayer.Character
         local hl = char and char:FindFirstChild("ByakuganAura")
         if hl then hl:Destroy() end
@@ -2976,33 +3161,58 @@ renderConn = RunService.RenderStepped:Connect(function()
                                                 + math.sqrt(speed)
                                                 + speed * (pingSec * 2 + 0.06))
                                                 / 2, 15, 50)
-                                        -- touch lead: the sphere's own crossing
-                                        -- time (R/speed), floored at the packet's
-                                        -- send lead (2*ping + 0.1 — a fast ball
-                                        -- must be fired BEFORE touch or the
-                                        -- packet lands after contact), capped
-                                        -- 0.5 s like the old window. NEURA's
-                                        -- learned latency bias still shifts it.
-                                        local sphereT = math.min(math.max(
-                                                sphereR / math.max(speed, 1),
-                                                pingSec * 2 + 0.1), 0.5)
+                                        -- touch lead: SPHERE mode = the sphere's
+                                        -- own crossing time (R/speed), floored
+                                        -- at the packet's send lead (2*ping +
+                                        -- 0.1 — a fast ball must be fired BEFORE
+                                        -- touch or the packet lands after
+                                        -- contact), capped 0.5 s. TIMER mode =
+                                        -- the classic v26.4/v27.2 send-lead
+                                        -- window, verbatim. NEURA's learned
+                                        -- latency bias still shifts either one.
+                                        local sphereT = (parryMode == "Sphere"
+                                                and math.min(math.max(
+                                                        sphereR / math.max(speed, 1),
+                                                        pingSec * 2 + 0.1), 0.5)
+                                                or ttiFireWindow(speed))
                                                 + neuraBias(root, ball,
                                                         framePhys, vel,
                                                         speed, tti, lateral,
                                                         pingSec)
+                                        -- kept for the "Getting close" status
+                                        -- (+ TIMER mode's proximity fallback)
+                                        local nearDist = predictPct > 0
+                                                and (root.Position - measPos).Magnitude
+                                                or distReal
                                         -- frame-rate independent touch: the
                                         -- path must pass INSIDE the sphere
                                         -- (lateral) and reach it within the
                                         -- lead (tti) — identical result to a
                                         -- continuous touch test, but mobile
                                         -- frame drops can never tunnel past
-                                        -- the sphere between two frames
-                                        local sphereHit = tti <= sphereT
-                                                and lateral <= sphereR
-                                        -- kept for the "Getting close" status
-                                        local nearDist = predictPct > 0
-                                                and (root.Position - measPos).Magnitude
-                                                or distReal
+                                        -- the sphere between two frames.
+                                        -- TIMER mode keeps the EXACT v26.4/
+                                        -- v27.2 trigger: tti <= window inside
+                                        -- the accuracy radius, plus the real-
+                                        -- distance proximity fallback.
+                                        local sphereHit
+                                        if parryMode == "Sphere" then
+                                                sphereHit = tti <= sphereT
+                                                        and lateral <= sphereR
+                                        else
+                                                sphereHit = (tti <= sphereT
+                                                        and lateral <= math.max(
+                                                                accuracy * 0.55, 12))
+                                                        or (nearDist <= accuracy
+                                                                and (speed < 140
+                                                                        or nearDist < 70))
+                                        end
+                                        -- v27.4: the sphere is VISIBLE in SPHERE
+                                        -- mode — a red ForceField bubble hugging
+                                        -- the live hitbox, resized every frame
+                                        if parryMode == "Sphere" then
+                                                sphereVisShow(root, sphereR)
+                                        end
                                         -- v27.2: PANIC refire REMOVED. On a fast
                                         -- curve the redirect can flip in steps the
                                         -- dot < 0.3 latch reads as steering, the
@@ -3075,8 +3285,11 @@ renderConn = RunService.RenderStepped:Connect(function()
                                                 lastTtiBucket = -1
                                                 fxBurst()
                                                 fireSelected()
-                                                setBaseStatus(predictPct > 0
-                                                        and "PREDICT PARRY" or "TTI PARRY")
+                                                setBaseStatus(parryMode == "Sphere"
+                                                        and "SPHERE PARRY"
+                                                        or (predictPct > 0
+                                                                and "PREDICT PARRY"
+                                                                or "TTI PARRY"))
                                         elseif target == LocalPlayer.Name then
                                                 if blocked then
                                                         setBaseStatus("PROTECTED")
@@ -3102,6 +3315,14 @@ renderConn = RunService.RenderStepped:Connect(function()
                         else
                                 setBaseStatus(getBalls() and "Waiting" or "No ball")
                         end
+                end
+
+                -- v27.4: the visible sphere only lives while it IS the
+                -- trigger (sphere mode + auto parry + live zoomies ball)
+                if parryMode ~= "Sphere" or not isRunning
+                        or not (ball and root)
+                        or not ball:FindFirstChild("zoomies") then
+                        sphereVisHide()
                 end
 
                 if os.clock() - lastHud >= (perfMode and 0.34 or 0.2) then
